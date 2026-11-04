@@ -1,0 +1,10 @@
+bin/
+dist/
+build/
+*.exe
+*.test
+*.out
+.DS_Store
+.idea/
+.vscode/
+config.local.json
