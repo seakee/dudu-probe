@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # dudu-probe 一键安装 / 升级 / 卸载 / 常驻守护管理脚本
-# 支持系统: Linux (systemd / OpenRC / OpenWrt procd), macOS (launchd)
+# 支持系统: Linux (systemd / OpenRC / OpenWrt procd / QNAP QTS), macOS (launchd)
 #
 # 用法示例:
 #   curl -fsSL https://raw.githubusercontent.com/seakee/dudu-probe/main/scripts/install.sh | sudo bash -s -- \
@@ -24,6 +24,8 @@ OPENRC_INIT="/etc/init.d/dudu-probe"
 LAUNCHD_PLIST="/Library/LaunchDaemons/com.seakee.dudu-probe.plist"
 LAUNCHD_LOG="/var/log/dudu-probe.log"
 LAUNCHD_ERR="/var/log/dudu-probe.err"
+QPKG_CONF="/etc/config/qpkg.conf"
+QPKG_DIR=""
 TMP_DIR=""
 
 cleanup_tmp() {
@@ -113,6 +115,40 @@ detect_platform() {
     *)              err "暂不支持的 CPU 架构: $arch" ;;
   esac
 }
+is_qnap_qts() {
+  [[ "$(uname -s)" == "Linux" && -f "$QPKG_CONF" && -x /sbin/getcfg && -x /sbin/setcfg ]]
+}
+
+resolve_qpkg_dir() {
+  if [[ -n "${QPKG_DIR:-}" ]]; then
+    printf "%s" "$QPKG_DIR"
+    return
+  fi
+  local existing
+  existing="$(/sbin/getcfg dudu-probe Install_Path -f "$QPKG_CONF" 2>/dev/null || true)"
+  if [[ -n "$existing" ]]; then
+    QPKG_DIR="$existing"
+    printf "%s" "$QPKG_DIR"
+    return
+  fi
+  local pub
+  pub="$(/sbin/getcfg Public path -f /etc/config/smb.conf 2>/dev/null || true)"
+  if [[ -n "$pub" && -d "${pub%/Public}/.qpkg" ]]; then
+    QPKG_DIR="${pub%/Public}/.qpkg/dudu-probe"
+    printf "%s" "$QPKG_DIR"
+    return
+  fi
+  local d
+  for d in /share/CACHEDEV*_DATA/.qpkg /share/MD*_DATA/.qpkg /share/HDA_DATA/.qpkg; do
+    if [[ -d "$d" ]]; then
+      QPKG_DIR="${d}/dudu-probe"
+      printf "%s" "$QPKG_DIR"
+      return
+    fi
+  done
+  QPKG_DIR="/etc/config/dudu-probe"
+  printf "%s" "$QPKG_DIR"
+}
 
 stop_service() {
   if [[ "$(uname -s)" == "Darwin" && -f "$LAUNCHD_PLIST" ]]; then
@@ -123,6 +159,12 @@ stop_service() {
     rc-service dudu-probe stop >/dev/null 2>&1 || true
   elif [[ "$(uname -s)" == "Linux" && -f /etc/rc.common && -f "$OPENRC_INIT" ]]; then
     "$OPENRC_INIT" stop >/dev/null 2>&1 || true
+  elif is_qnap_qts; then
+    local qdir
+    qdir="$(resolve_qpkg_dir)"
+    if [[ -x "${qdir}/dudu-probe.sh" ]]; then
+      "${qdir}/dudu-probe.sh" stop >/dev/null 2>&1 || true
+    fi
   fi
 }
 
@@ -139,6 +181,13 @@ uninstall_probe() {
     rc-update del dudu-probe default >/dev/null 2>&1 || true
   elif [[ "$(uname -s)" == "Linux" && -f /etc/rc.common && -f "$OPENRC_INIT" ]]; then
     "$OPENRC_INIT" disable >/dev/null 2>&1 || true
+  elif is_qnap_qts; then
+    local qdir
+    qdir="$(resolve_qpkg_dir)"
+    if [[ -x /sbin/rmcfg ]]; then
+      /sbin/rmcfg dudu-probe -f "$QPKG_CONF" >/dev/null 2>&1 || true
+    fi
+    rm -rf "$qdir"
   fi
   rm -f "$OPENRC_INIT" "$LAUNCHD_PLIST" "$INSTALL_BIN" "$LAUNCHD_LOG" "$LAUNCHD_ERR"
   rm -rf "$CONFIG_DIR"
@@ -189,8 +238,17 @@ download_binary() {
 
   mkdir -p "$(dirname "$INSTALL_BIN")"
   stop_service
-  cp -f "$bin_path" "$INSTALL_BIN"
-  chmod 0755 "$INSTALL_BIN"
+  if is_qnap_qts; then
+    local qdir
+    qdir="$(resolve_qpkg_dir)"
+    mkdir -p "$qdir"
+    cp -f "$bin_path" "${qdir}/${BINARY_NAME}"
+    chmod 0755 "${qdir}/${BINARY_NAME}"
+    ln -sf "${qdir}/${BINARY_NAME}" "$INSTALL_BIN"
+  else
+    cp -f "$bin_path" "$INSTALL_BIN"
+    chmod 0755 "$INSTALL_BIN"
+  fi
   ok "已安装二进制至 ${INSTALL_BIN} ($(${INSTALL_BIN} -version))"
   cleanup_tmp
   TMP_DIR=""
@@ -208,14 +266,34 @@ json_escape() {
 write_config() {
   mkdir -p "$CONFIG_DIR"
   chmod 0700 "$CONFIG_DIR"
+  local qcfg=""
+  if is_qnap_qts; then
+    local qdir
+    qdir="$(resolve_qpkg_dir)"
+    mkdir -p "$qdir"
+    qcfg="${qdir}/config.json"
+    if [[ ! -f "$CONFIG_FILE" && -f "$qcfg" ]]; then
+      ln -sf "$qcfg" "$CONFIG_FILE"
+    fi
+  fi
 
   if [[ "$ACTION" == "upgrade" && -f "$CONFIG_FILE" && -z "$SERVER_URL" ]]; then
+    if [[ -n "$qcfg" && ! -f "$qcfg" ]]; then
+      cp -f "$CONFIG_FILE" "$qcfg"
+      chmod 0600 "$qcfg"
+      ln -sf "$qcfg" "$CONFIG_FILE"
+    fi
     info "升级模式：保留现有配置文件 ${CONFIG_FILE}"
     return
   fi
 
   if [[ -z "$SERVER_URL" || -z "$NODE_KEY" || -z "$SECRET" ]]; then
     if [[ -f "$CONFIG_FILE" ]]; then
+      if [[ -n "$qcfg" && ! -f "$qcfg" ]]; then
+        cp -f "$CONFIG_FILE" "$qcfg"
+        chmod 0600 "$qcfg"
+        ln -sf "$qcfg" "$CONFIG_FILE"
+      fi
       info "未传入新凭证，保留现有配置文件 ${CONFIG_FILE}"
       return
     fi
@@ -231,7 +309,12 @@ write_config() {
   esc_key="$(json_escape "$NODE_KEY")"
   esc_secret="$(json_escape "$SECRET")"
 
-  cat >"$CONFIG_FILE" <<EOF
+  local target_cfg="$CONFIG_FILE"
+  if [[ -n "$qcfg" ]]; then
+    target_cfg="$qcfg"
+  fi
+
+  cat >"$target_cfg" <<EOF
 {
   "server_url": "${esc_server}",
   "node_key": "${esc_key}",
@@ -243,7 +326,10 @@ write_config() {
   "host_root": "/"
 }
 EOF
-  chmod 0600 "$CONFIG_FILE"
+  chmod 0600 "$target_cfg"
+  if [[ -n "$qcfg" ]]; then
+    ln -sf "$qcfg" "$CONFIG_FILE"
+  fi
   ok "配置文件已写入 ${CONFIG_FILE}"
 }
 
@@ -338,6 +424,99 @@ EOF
       "$OPENRC_INIT" start
     fi
     ok "OpenWrt procd 服务已启动并设为开机自启"
+  elif is_qnap_qts; then
+    local qdir qsh
+    qdir="$(resolve_qpkg_dir)"
+    qsh="${qdir}/dudu-probe.sh"
+    mkdir -p "$qdir"
+    cat >"$qsh" <<EOF
+#!/bin/sh
+QPKG_NAME="dudu-probe"
+QPKG_DIR="${qdir}"
+BIN="\${QPKG_DIR}/${BINARY_NAME}"
+CFG="\${QPKG_DIR}/config.json"
+LOG="\${QPKG_DIR}/dudu-probe.log"
+SUP_PID_FILE="/var/run/dudu-probe-supervisor.pid"
+
+ensure_links() {
+  mkdir -p "$(dirname "$INSTALL_BIN")" "${CONFIG_DIR}"
+  chmod 0700 "${CONFIG_DIR}"
+  ln -sf "\$BIN" "${INSTALL_BIN}"
+  ln -sf "\$CFG" "${CONFIG_FILE}"
+}
+
+stop_all() {
+  if [ -f "\$SUP_PID_FILE" ]; then
+    sup_pid="\$(cat "\$SUP_PID_FILE" 2>/dev/null || true)"
+    if [ -n "\$sup_pid" ]; then
+      kill "\$sup_pid" >/dev/null 2>&1 || true
+    fi
+    rm -f "\$SUP_PID_FILE"
+  fi
+  for p in \$(pidof ${BINARY_NAME} 2>/dev/null || true); do
+    kill "\$p" >/dev/null 2>&1 || true
+  done
+  sleep 1
+  for p in \$(pidof ${BINARY_NAME} 2>/dev/null || true); do
+    kill -9 "\$p" >/dev/null 2>&1 || true
+  done
+}
+
+start_all() {
+  ensure_links
+  if [ -n "\$(pidof ${BINARY_NAME} 2>/dev/null || true)" ]; then
+    return 0
+  fi
+  (
+    while true; do
+      if [ -f "\$LOG" ] && [ "\$(wc -c <"\$LOG" 2>/dev/null || echo 0)" -gt 5242880 ]; then
+        mv -f "\$LOG" "\${LOG}.1"
+      fi
+      "\$BIN" -config "\$CFG" >>"\$LOG" 2>&1
+      sleep 5
+    done
+  ) </dev/null >/dev/null 2>&1 &
+  echo \$! >"\$SUP_PID_FILE"
+}
+
+case "\${1:-}" in
+  start)
+    start_all
+    ;;
+  stop)
+    stop_all
+    ;;
+  restart)
+    stop_all
+    start_all
+    ;;
+  status)
+    pids="\$(pidof ${BINARY_NAME} 2>/dev/null || true)"
+    if [ -n "\$pids" ]; then
+      echo "dudu-probe is running (pid: \$pids)"
+      exit 0
+    else
+      echo "dudu-probe is stopped"
+      exit 1
+    fi
+    ;;
+  *)
+    echo "Usage: \$0 {start|stop|restart|status}"
+    exit 1
+    ;;
+esac
+EOF
+    chmod 0755 "$qsh"
+    /sbin/setcfg dudu-probe Name dudu-probe -f "$QPKG_CONF"
+    /sbin/setcfg dudu-probe Display_Name "Dudu Probe Agent" -f "$QPKG_CONF"
+    /sbin/setcfg dudu-probe Version "${VERSION}" -f "$QPKG_CONF"
+    /sbin/setcfg dudu-probe Enable TRUE -f "$QPKG_CONF"
+    /sbin/setcfg dudu-probe Status complete -f "$QPKG_CONF"
+    /sbin/setcfg dudu-probe Install_Path "$qdir" -f "$QPKG_CONF"
+    /sbin/setcfg dudu-probe Shell "$qsh" -f "$QPKG_CONF"
+    /sbin/setcfg dudu-probe Author "seakee" -f "$QPKG_CONF"
+    "$qsh" restart
+    ok "QNAP QTS 常驻服务已启动并设为开机自启 (${qsh})"
   else
     warn "未检测到受支持的 init 系统，请手动后台运行: ${INSTALL_BIN} -config ${CONFIG_FILE}"
   fi
@@ -351,6 +530,14 @@ status_service() {
     rc-service dudu-probe status
   elif [[ "$(uname -s)" == "Linux" && -f /etc/rc.common && -f "$OPENRC_INIT" ]]; then
     "$OPENRC_INIT" status || true
+  elif is_qnap_qts; then
+    local qdir
+    qdir="$(resolve_qpkg_dir)"
+    if [[ -x "${qdir}/dudu-probe.sh" ]]; then
+      "${qdir}/dudu-probe.sh" status || true
+    else
+      info "dudu-probe 未在运行"
+    fi
   else
     pgrep -fl dudu-probe || info "dudu-probe 未在运行"
   fi
@@ -367,6 +554,14 @@ restart_service() {
     rc-service dudu-probe restart
   elif [[ "$(uname -s)" == "Linux" && -f /etc/rc.common && -f "$OPENRC_INIT" ]]; then
     "$OPENRC_INIT" restart
+  elif is_qnap_qts; then
+    local qdir
+    qdir="$(resolve_qpkg_dir)"
+    if [[ -x "${qdir}/dudu-probe.sh" ]]; then
+      "${qdir}/dudu-probe.sh" restart
+    else
+      err "未检测到已注册的 QNAP QTS 服务"
+    fi
   else
     err "未检测到已注册的系统服务"
   fi

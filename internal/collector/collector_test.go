@@ -25,6 +25,16 @@ func TestFilterRules(t *testing.T) {
 	if ShouldIgnorePartition("/", "ext4", "/dev/sda1") {
 		t.Fatal("expected root ext4 partition not to be ignored")
 	}
+	if !ShouldIgnorePartition("/mnt/HDA_ROOT", "ext3", "/dev/md9") || !ShouldIgnorePartition("/mnt/ext", "ext4", "/dev/md13") {
+		t.Fatal("expected QNAP QTS system firmware partitions to be ignored")
+	}
+	if !ShouldIgnorePartition("/share/CACHEDEV1_DATA/.qpkg/MediaSignPlayer/CodexPackExt/share", "fuse.hdsfusemnt", "hdsfusemnt") {
+		t.Fatal("expected QNAP QTS .qpkg fuse mount to be ignored")
+	}
+	if ShouldIgnorePartition("/share/CACHEDEV1_DATA", "ext4", "/dev/mapper/cachedev1") {
+		t.Fatal("expected QNAP QTS CACHEDEV1_DATA data volume not to be ignored")
+	}
+
 	if !ShouldIgnoreNetInterface("lo") || !ShouldIgnoreNetInterface("docker0") || !ShouldIgnoreNetInterface("veth1a2b") {
 		t.Fatal("expected virtual/loopback interfaces to be ignored")
 	}

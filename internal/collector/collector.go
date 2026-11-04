@@ -333,9 +333,12 @@ func ShouldIgnorePartition(mountpoint, fstype, device string) bool {
 		"tracefs":     true,
 		"debugfs":     true,
 		"mqueue":      true,
-		"hugetlbfs":   true,
-		"fuse.lxcfs":  true,
-		"iso9660":     true,
+		"hugetlbfs":       true,
+		"fuse":            true,
+		"fuse.lxcfs":      true,
+		"fuse.hdsfusemnt": true,
+		"cmfs":            true,
+		"iso9660":         true,
 		"udf":         true,
 		"ramfs":       true,
 		"pstore":      true,
@@ -365,11 +368,18 @@ func ShouldIgnorePartition(mountpoint, fstype, device string) bool {
 		"/System/Volumes/iSCPreboot",
 		"/System/Volumes/Hardware",
 		"/private/var/vm",
+		"/mnt/boot_config",
+		"/mnt/HDA_ROOT",
+		"/mnt/ext",
+		"/share/external/.cm",
 	}
 	for _, prefix := range ignoredPrefixes {
 		if mp == prefix || strings.HasPrefix(mp, prefix+"/") {
 			return true
 		}
+	}
+	if strings.Contains(mp, "/.qpkg/") {
+		return true
 	}
 	if strings.HasPrefix(device, "/dev/loop") {
 		return true
