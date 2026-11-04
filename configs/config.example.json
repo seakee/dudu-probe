@@ -1,0 +1,10 @@
+{
+  "server_url": "https://your-dudu-server.example.com",
+  "node_key": "probe_replace_with_node_key",
+  "secret": "sec_replace_with_node_secret",
+  "report_interval_sec": 10,
+  "http_timeout_sec": 10,
+  "insecure_tls": false,
+  "enable_gzip": false,
+  "host_root": "/"
+}
