@@ -95,7 +95,7 @@ require_root() {
 
 detect_platform() {
   local os arch
-  os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+  os="$(uname -s | tr 'A-Z' 'a-z')"
   arch="$(uname -m)"
 
   case "$os" in
@@ -137,6 +137,8 @@ uninstall_probe() {
   fi
   if command -v rc-update >/dev/null 2>&1 && [[ -f "$OPENRC_INIT" ]]; then
     rc-update del dudu-probe default >/dev/null 2>&1 || true
+  elif [[ "$(uname -s)" == "Linux" && -f /etc/rc.common && -f "$OPENRC_INIT" ]]; then
+    "$OPENRC_INIT" disable >/dev/null 2>&1 || true
   fi
   rm -f "$OPENRC_INIT" "$LAUNCHD_PLIST" "$INSTALL_BIN" "$LAUNCHD_LOG" "$LAUNCHD_ERR"
   rm -rf "$CONFIG_DIR"
@@ -187,7 +189,8 @@ download_binary() {
 
   mkdir -p "$(dirname "$INSTALL_BIN")"
   stop_service
-  install -m 0755 "$bin_path" "$INSTALL_BIN"
+  cp -f "$bin_path" "$INSTALL_BIN"
+  chmod 0755 "$INSTALL_BIN"
   ok "已安装二进制至 ${INSTALL_BIN} ($(${INSTALL_BIN} -version))"
   cleanup_tmp
   TMP_DIR=""
@@ -329,7 +332,11 @@ start_service() {
 EOF
     chmod +x "$OPENRC_INIT"
     "$OPENRC_INIT" enable
-    "$OPENRC_INIT" restart
+    if "$OPENRC_INIT" running >/dev/null 2>&1; then
+      "$OPENRC_INIT" restart
+    else
+      "$OPENRC_INIT" start
+    fi
     ok "OpenWrt procd 服务已启动并设为开机自启"
   else
     warn "未检测到受支持的 init 系统，请手动后台运行: ${INSTALL_BIN} -config ${CONFIG_FILE}"

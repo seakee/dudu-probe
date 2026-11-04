@@ -313,15 +313,18 @@ func collectDiskPartitions(ctx context.Context, fallbackRoot string) ([]DiskPart
 
 // ShouldIgnorePartition 判断挂载点或文件系统是否为虚拟/临时分区。
 func ShouldIgnorePartition(mountpoint, fstype, device string) bool {
+	mp := strings.TrimSpace(mountpoint)
 	fs := strings.ToLower(strings.TrimSpace(fstype))
+	if (fs == "overlay" || fs == "overlayfs") && mp == "/" {
+		return false
+	}
 	ignoredFS := map[string]bool{
 		"tmpfs":       true,
 		"devtmpfs":    true,
 		"devfs":       true,
 		"squashfs":    true,
 		"overlay":     true,
-		"aufs":        true,
-		"proc":        true,
+		"overlayfs":   true,
 		"sysfs":       true,
 		"cgroup":      true,
 		"cgroup2":     true,
@@ -345,7 +348,6 @@ func ShouldIgnorePartition(mountpoint, fstype, device string) bool {
 		return true
 	}
 
-	mp := strings.TrimSpace(mountpoint)
 	ignoredPrefixes := []string{
 		"/proc",
 		"/sys",

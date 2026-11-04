@@ -13,13 +13,18 @@ func TestFilterRules(t *testing.T) {
 	if !ShouldIgnorePartition("/var/lib/docker/overlay2/abc", "overlay", "overlay") {
 		t.Fatal("expected docker overlay partition to be ignored")
 	}
+	if !ShouldIgnorePartition("/opt/docker", "overlay", "overlayfs:/overlay") {
+		t.Fatal("expected non-root overlay partition to be ignored")
+	}
+	if ShouldIgnorePartition("/", "overlay", "overlayfs:/overlay") {
+		t.Fatal("expected OpenWrt root overlay partition (/) not to be ignored")
+	}
 	if !ShouldIgnorePartition("/etc/hosts", "ext4", "/dev/vda1") {
 		t.Fatal("expected /etc/hosts bind mount to be ignored")
 	}
 	if ShouldIgnorePartition("/", "ext4", "/dev/sda1") {
 		t.Fatal("expected root ext4 partition not to be ignored")
 	}
-
 	if !ShouldIgnoreNetInterface("lo") || !ShouldIgnoreNetInterface("docker0") || !ShouldIgnoreNetInterface("veth1a2b") {
 		t.Fatal("expected virtual/loopback interfaces to be ignored")
 	}

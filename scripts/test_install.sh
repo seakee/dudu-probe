@@ -79,9 +79,22 @@ cat >"${FAKE_BIN}/rc-service" <<'EOF'
 echo "unexpected rc-service call on Darwin" >&2
 exit 99
 EOF
+cat >"${FAKE_BIN}/tr" <<'EOF'
+#!/usr/bin/env bash
+# Simulate BusyBox tr without CONFIG_FEATURE_TR_CLASSES (where [:upper:] fails)
+if [[ "${1:-}" == "[:upper:]" ]]; then
+  echo "Linlx"
+  exit 0
+fi
+exec /usr/bin/tr "$@"
+EOF
+cat >"${FAKE_BIN}/install" <<'EOF'
+#!/usr/bin/env bash
+echo "unexpected GNU install call (missing on OpenWrt BusyBox)" >&2
+exit 99
+EOF
 
-chmod 0755 "${FAKE_BIN}/uname" "${FAKE_BIN}/id" "${FAKE_BIN}/curl" "${FAKE_BIN}/launchctl" "${FAKE_BIN}/systemctl" "${FAKE_BIN}/rc-service"
-
+chmod 0755 "${FAKE_BIN}/uname" "${FAKE_BIN}/id" "${FAKE_BIN}/curl" "${FAKE_BIN}/launchctl" "${FAKE_BIN}/systemctl" "${FAKE_BIN}/rc-service" "${FAKE_BIN}/tr" "${FAKE_BIN}/install"
 PATCHED_INSTALL="${TEST_ROOT}/install-under-test.sh"
 sed \
   -e "s|^INSTALL_BIN=.*|INSTALL_BIN=\"${TEST_ROOT}/usr/local/bin/dudu-probe\"|" \
