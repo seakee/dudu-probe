@@ -248,6 +248,24 @@ func collectDiskPartitions(ctx context.Context, fallbackRoot string) ([]DiskPart
 	seenMounts := make(map[string]struct{})
 
 	if err == nil {
+		hasRootMount := false
+		for _, p := range parts {
+			if p.Mountpoint == "/" {
+				hasRootMount = true
+				break
+			}
+		}
+		if !hasRootMount {
+			if allParts, allErr := disk.PartitionsWithContext(ctx, true); allErr == nil {
+				for _, ap := range allParts {
+					fs := strings.ToLower(strings.TrimSpace(ap.Fstype))
+					if ap.Mountpoint == "/" && (fs == "overlay" || fs == "overlayfs") {
+						parts = append(parts, ap)
+						break
+					}
+				}
+			}
+		}
 		sort.SliceStable(parts, func(i, j int) bool {
 			return len(parts[i].Mountpoint) < len(parts[j].Mountpoint)
 		})
