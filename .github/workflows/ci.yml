@@ -22,5 +22,7 @@ jobs:
         run: go vet ./...
       - name: Test
         run: go test -v -race ./...
+      - name: Installer script test
+        run: bash scripts/test_install.sh
       - name: Build smoke check
         run: CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/dudu-probe ./cmd/dudu-probe
