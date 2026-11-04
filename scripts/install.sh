@@ -22,6 +22,16 @@ CONFIG_FILE="${CONFIG_DIR}/config.json"
 SYSTEMD_UNIT="/etc/systemd/system/dudu-probe.service"
 OPENRC_INIT="/etc/init.d/dudu-probe"
 LAUNCHD_PLIST="/Library/LaunchDaemons/com.seakee.dudu-probe.plist"
+LAUNCHD_LOG="/var/log/dudu-probe.log"
+LAUNCHD_ERR="/var/log/dudu-probe.err"
+TMP_DIR=""
+
+cleanup_tmp() {
+  if [[ -n "${TMP_DIR:-}" && -d "${TMP_DIR}" ]]; then
+    rm -rf "${TMP_DIR}"
+  fi
+}
+trap cleanup_tmp EXIT
 
 ACTION="install"
 SERVER_URL="${DUDU_PROBE_SERVER:-}"
@@ -105,14 +115,14 @@ detect_platform() {
 }
 
 stop_service() {
-  if command -v systemctl >/dev/null 2>&1 && [[ -f "$SYSTEMD_UNIT" ]]; then
+  if [[ "$(uname -s)" == "Darwin" && -f "$LAUNCHD_PLIST" ]]; then
+    launchctl unload "$LAUNCHD_PLIST" >/dev/null 2>&1 || true
+  elif command -v systemctl >/dev/null 2>&1 && [[ -f "$SYSTEMD_UNIT" ]]; then
     systemctl stop dudu-probe >/dev/null 2>&1 || true
   elif command -v rc-service >/dev/null 2>&1 && [[ -f "$OPENRC_INIT" ]]; then
     rc-service dudu-probe stop >/dev/null 2>&1 || true
-  elif [[ -f /etc/rc.common && -f "$OPENRC_INIT" ]]; then
+  elif [[ "$(uname -s)" == "Linux" && -f /etc/rc.common && -f "$OPENRC_INIT" ]]; then
     "$OPENRC_INIT" stop >/dev/null 2>&1 || true
-  elif [[ "$(uname -s)" == "Darwin" && -f "$LAUNCHD_PLIST" ]]; then
-    launchctl unload "$LAUNCHD_PLIST" >/dev/null 2>&1 || true
   fi
 }
 
@@ -128,7 +138,7 @@ uninstall_probe() {
   if command -v rc-update >/dev/null 2>&1 && [[ -f "$OPENRC_INIT" ]]; then
     rc-update del dudu-probe default >/dev/null 2>&1 || true
   fi
-  rm -f "$OPENRC_INIT" "$LAUNCHD_PLIST" "$INSTALL_BIN"
+  rm -f "$OPENRC_INIT" "$LAUNCHD_PLIST" "$INSTALL_BIN" "$LAUNCHD_LOG" "$LAUNCHD_ERR"
   rm -rf "$CONFIG_DIR"
   ok "dudu-probe 已彻底卸载"
 }
@@ -162,16 +172,15 @@ download_binary() {
   local ver_num="${tag#v}"
   local tarball="${BINARY_NAME}_${ver_num}_${OS}_${ARCH}.tar.gz"
   local url="${prefix}https://github.com/${REPO}/releases/download/${tag}/${tarball}"
-  local tmp_dir
-  tmp_dir="$(mktemp -d)"
-  trap 'rm -rf "$tmp_dir"' EXIT
+  cleanup_tmp
+  TMP_DIR="$(mktemp -d)"
 
   info "正在下载 ${url} ..."
-  curl -fL --retry 3 --connect-timeout 15 -o "${tmp_dir}/${tarball}" "$url"
-  tar -xzf "${tmp_dir}/${tarball}" -C "$tmp_dir"
+  curl -fL --retry 3 --connect-timeout 15 -o "${TMP_DIR}/${tarball}" "$url"
+  tar -xzf "${TMP_DIR}/${tarball}" -C "$TMP_DIR"
 
   local bin_path
-  bin_path="$(find "$tmp_dir" -type f -name "$BINARY_NAME" | head -n1)"
+  bin_path="$(find "$TMP_DIR" -type f -name "$BINARY_NAME" | head -n1)"
   if [[ -z "$bin_path" ]]; then
     err "解压后未找到 ${BINARY_NAME} 可执行文件"
   fi
@@ -180,6 +189,8 @@ download_binary() {
   stop_service
   install -m 0755 "$bin_path" "$INSTALL_BIN"
   ok "已安装二进制至 ${INSTALL_BIN} ($(${INSTALL_BIN} -version))"
+  cleanup_tmp
+  TMP_DIR=""
 }
 
 json_escape() {
@@ -234,7 +245,38 @@ EOF
 }
 
 setup_service() {
-  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    mkdir -p "$(dirname "$LAUNCHD_PLIST")"
+    cat >"$LAUNCHD_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.seakee.dudu-probe</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${INSTALL_BIN}</string>
+    <string>-config</string>
+    <string>${CONFIG_FILE}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>StandardOutPath</key>
+  <string>${LAUNCHD_LOG}</string>
+  <key>StandardErrorPath</key>
+  <string>${LAUNCHD_ERR}</string>
+</dict>
+</plist>
+EOF
+    launchctl unload "$LAUNCHD_PLIST" >/dev/null 2>&1 || true
+    launchctl load -w "$LAUNCHD_PLIST"
+    ok "macOS launchd 服务已启动并设为常驻"
+  elif command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
     cat >"$SYSTEMD_UNIT" <<EOF
 [Unit]
 Description=Dudu Server Probe Agent
@@ -257,6 +299,7 @@ EOF
     systemctl enable --now dudu-probe
     ok "systemd 服务已启动并设置为开机自启 (systemctl status dudu-probe)"
   elif command -v rc-service >/dev/null 2>&1; then
+    mkdir -p "$(dirname "$OPENRC_INIT")"
     cat >"$OPENRC_INIT" <<EOF
 #!/sbin/openrc-run
 name="dudu-probe"
@@ -272,7 +315,7 @@ EOF
     rc-update add dudu-probe default
     rc-service dudu-probe restart
     ok "OpenRC 服务已启动并设为开机自启"
-  elif [[ -f /etc/rc.common ]]; then
+  elif [[ "$(uname -s)" == "Linux" && -f /etc/rc.common && -d /etc/init.d ]]; then
     cat >"$OPENRC_INIT" <<EOF
 #!/bin/sh /etc/rc.common
 START=99
@@ -288,47 +331,19 @@ EOF
     "$OPENRC_INIT" enable
     "$OPENRC_INIT" restart
     ok "OpenWrt procd 服务已启动并设为开机自启"
-  elif [[ "$(uname -s)" == "Darwin" ]]; then
-    cat >"$LAUNCHD_PLIST" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>com.seakee.dudu-probe</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${INSTALL_BIN}</string>
-    <string>-config</string>
-    <string>${CONFIG_FILE}</string>
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>/var/log/dudu-probe.log</string>
-  <key>StandardErrorPath</key>
-  <string>/var/log/dudu-probe.err</string>
-</dict>
-</plist>
-EOF
-    launchctl load -w "$LAUNCHD_PLIST"
-    ok "macOS launchd 服务已启动并设为常驻"
   else
     warn "未检测到受支持的 init 系统，请手动后台运行: ${INSTALL_BIN} -config ${CONFIG_FILE}"
   fi
 }
-
 status_service() {
-  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    launchctl list | grep com.seakee.dudu-probe || info "dudu-probe 未在运行"
+  elif command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
     systemctl status dudu-probe --no-pager
   elif command -v rc-service >/dev/null 2>&1 && [[ -f "$OPENRC_INIT" ]]; then
     rc-service dudu-probe status
-  elif [[ -f /etc/rc.common && -f "$OPENRC_INIT" ]]; then
+  elif [[ "$(uname -s)" == "Linux" && -f /etc/rc.common && -f "$OPENRC_INIT" ]]; then
     "$OPENRC_INIT" status || true
-  elif [[ "$(uname -s)" == "Darwin" ]]; then
-    launchctl list | grep com.seakee.dudu-probe || info "dudu-probe 未在运行"
   else
     pgrep -fl dudu-probe || info "dudu-probe 未在运行"
   fi
@@ -336,15 +351,15 @@ status_service() {
 
 restart_service() {
   require_root
-  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+  if [[ "$(uname -s)" == "Darwin" && -f "$LAUNCHD_PLIST" ]]; then
+    launchctl unload "$LAUNCHD_PLIST" >/dev/null 2>&1 || true
+    launchctl load -w "$LAUNCHD_PLIST"
+  elif command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
     systemctl restart dudu-probe
   elif command -v rc-service >/dev/null 2>&1 && [[ -f "$OPENRC_INIT" ]]; then
     rc-service dudu-probe restart
-  elif [[ -f /etc/rc.common && -f "$OPENRC_INIT" ]]; then
+  elif [[ "$(uname -s)" == "Linux" && -f /etc/rc.common && -f "$OPENRC_INIT" ]]; then
     "$OPENRC_INIT" restart
-  elif [[ "$(uname -s)" == "Darwin" && -f "$LAUNCHD_PLIST" ]]; then
-    launchctl unload "$LAUNCHD_PLIST" >/dev/null 2>&1 || true
-    launchctl load -w "$LAUNCHD_PLIST"
   else
     err "未检测到已注册的系统服务"
   fi

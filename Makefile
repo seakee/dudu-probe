@@ -20,7 +20,7 @@ build-linux:
 
 test:
 	go test -v -race ./...
-
+	bash scripts/test_install.sh
 vet:
 	go vet ./...
 
