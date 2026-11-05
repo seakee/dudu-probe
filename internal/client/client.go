@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"time"
@@ -35,6 +36,13 @@ const (
 	HeaderProbeTimestamp = "X-Probe-Timestamp"
 	// HeaderProbeSignature HMAC-SHA256 请求签名请求头。
 	HeaderProbeSignature = "X-Probe-Signature"
+
+	defaultMaxAttempts    = 3
+	defaultRetryBaseDelay = 300 * time.Millisecond
+	defaultDialTimeout    = 5 * time.Second
+	defaultTCPKeepAlive   = 15 * time.Second
+	defaultTLSHandshake   = 5 * time.Second
+	defaultIdleConn       = 25 * time.Second
 )
 
 // ServerConfigAck 服务端在注册或心跳响应中下发的动态配置。
@@ -54,17 +62,45 @@ type apiEnvelope struct {
 
 // Client 封装向 dudu 服务端发送注册与指标数据的 HTTP 客户端。
 type Client struct {
-	cfg        *config.Config
-	httpClient *http.Client
+	cfg            *config.Config
+	httpClient     *http.Client
+	maxAttempts    int
+	retryBaseDelay time.Duration
 }
 
 // New 创建新的探针上报客户端。
+// 默认禁用 HTTP/2 多路复用并缩短空闲连接生命周期，防止经过 Cloudflare 代理或跨境链路时因半开死连接引发连续超时。
 func New(cfg *config.Config) *Client {
+	timeout := cfg.HTTPTimeout()
+	dialTimeout := defaultDialTimeout
+	if timeout > 0 && timeout < dialTimeout {
+		dialTimeout = timeout
+	}
+	tlsTimeout := defaultTLSHandshake
+	if timeout > 0 && timeout < tlsTimeout {
+		tlsTimeout = timeout
+	}
+	respHeaderTimeout := 10 * time.Second
+	if timeout > 0 && timeout < respHeaderTimeout {
+		respHeaderTimeout = timeout
+	}
+
+	dialer := &net.Dialer{
+		Timeout:       dialTimeout,
+		KeepAlive:     defaultTCPKeepAlive,
+		FallbackDelay: 300 * time.Millisecond,
+	}
 	tr := &http.Transport{
-		Proxy:               http.ProxyFromEnvironment,
-		MaxIdleConns:        10,
-		IdleConnTimeout:     60 * time.Second,
-		TLSHandshakeTimeout: 10 * time.Second,
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dialer.DialContext,
+		ForceAttemptHTTP2:     false,
+		TLSNextProto:          make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+		MaxIdleConns:          4,
+		MaxIdleConnsPerHost:   2,
+		IdleConnTimeout:       defaultIdleConn,
+		TLSHandshakeTimeout:   tlsTimeout,
+		ResponseHeaderTimeout: respHeaderTimeout,
+		ExpectContinueTimeout: 1 * time.Second,
 	}
 	if cfg.InsecureTLS {
 		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
@@ -73,9 +109,11 @@ func New(cfg *config.Config) *Client {
 	return &Client{
 		cfg: cfg,
 		httpClient: &http.Client{
-			Timeout:   cfg.HTTPTimeout(),
+			Timeout:   timeout,
 			Transport: tr,
 		},
+		maxAttempts:    defaultMaxAttempts,
+		retryBaseDelay: defaultRetryBaseDelay,
 	}
 }
 
@@ -107,10 +145,7 @@ func (c *Client) postJSON(ctx context.Context, path string, payload any) (*Serve
 		return nil, fmt.Errorf("序列化请求数据失败: %w", err)
 	}
 
-	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
-	signature := SignPayload(c.cfg.NodeKey, timestamp, rawBody, c.cfg.Secret)
-
-	var bodyReader io.Reader
+	wireBody := rawBody
 	if c.cfg.EnableGzip {
 		var buf bytes.Buffer
 		gz := gzip.NewWriter(&buf)
@@ -120,15 +155,55 @@ func (c *Client) postJSON(ctx context.Context, path string, payload any) (*Serve
 		if err := gz.Close(); err != nil {
 			return nil, fmt.Errorf("关闭 Gzip 流失败: %w", err)
 		}
-		bodyReader = &buf
-	} else {
-		bodyReader = bytes.NewReader(rawBody)
+		wireBody = buf.Bytes()
 	}
 
+	attempts := c.maxAttempts
+	if attempts <= 0 {
+		attempts = defaultMaxAttempts
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		if attempt > 0 {
+			if err := c.waitRetry(ctx, attempt); err != nil {
+				return nil, lastErr
+			}
+		}
+
+		ack, retryable, reqErr := c.doPostAttempt(ctx, path, rawBody, wireBody, attempt)
+		if reqErr == nil {
+			return ack, nil
+		}
+		lastErr = reqErr
+		if !retryable || ctx.Err() != nil {
+			return nil, lastErr
+		}
+	}
+	return nil, lastErr
+}
+
+func (c *Client) doPostAttempt(ctx context.Context, path string, rawBody, wireBody []byte, attempt int) (*ServerConfigAck, bool, error) {
+	attemptTimeout := c.attemptTimeout(attempt)
+	attemptCtx := ctx
+	var cancel context.CancelFunc
+	if attemptTimeout > 0 {
+		attemptCtx, cancel = context.WithTimeout(ctx, attemptTimeout)
+		defer cancel()
+	}
+
+	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+	signature := SignPayload(c.cfg.NodeKey, timestamp, rawBody, c.cfg.Secret)
+
 	url := c.cfg.ServerURL + path
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bodyReader)
+	req, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, url, bytes.NewReader(wireBody))
 	if err != nil {
-		return nil, fmt.Errorf("构建 HTTP 请求失败: %w", err)
+		return nil, false, fmt.Errorf("构建 HTTP 请求失败: %w", err)
+	}
+
+	// 重试时强制使用全新短连接，避免继续复用 Cloudflare 边缘或 NAT 老化连接
+	if attempt > 0 {
+		req.Close = true
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -144,26 +219,73 @@ func (c *Client) postJSON(ctx context.Context, path string, payload any) (*Serve
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("请求服务端 %s 失败: %w", path, err)
+		c.httpClient.CloseIdleConnections()
+		return nil, true, fmt.Errorf("请求服务端 %s 失败: %w", path, err)
 	}
 	defer resp.Body.Close()
 
 	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return nil, fmt.Errorf("读取服务端响应失败: %w", err)
+		c.httpClient.CloseIdleConnections()
+		return nil, true, fmt.Errorf("读取服务端 %s 响应失败: %w", path, err)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("服务端返回 HTTP %d: %s", resp.StatusCode, string(respBytes))
+		retryable := isRetryableStatusCode(resp.StatusCode)
+		if retryable {
+			c.httpClient.CloseIdleConnections()
+		}
+		return nil, retryable, fmt.Errorf("服务端返回 HTTP %d: %s", resp.StatusCode, string(respBytes))
 	}
 
 	var env apiEnvelope
 	if err := json.Unmarshal(respBytes, &env); err != nil {
-		return nil, fmt.Errorf("解析服务端 JSON 响应失败: %w", err)
+		c.httpClient.CloseIdleConnections()
+		return nil, true, fmt.Errorf("解析服务端 JSON 响应失败: %w", err)
 	}
 	if env.Code != 0 {
-		return nil, fmt.Errorf("服务端业务错误 (code=%d): %s", env.Code, env.Msg)
+		return nil, false, fmt.Errorf("服务端业务错误 (code=%d): %s", env.Code, env.Msg)
 	}
 
-	return env.Data, nil
+	return env.Data, false, nil
+}
+
+// attemptTimeout 计算单次请求尝试的超时时间。
+// 当基础超时 >= 10s 时，首次尝试控制在 6s、二次尝试控制在 8s，以便在遇到半开死连接或边缘节点卡顿时快速失败并重连。
+func (c *Client) attemptTimeout(attempt int) time.Duration {
+	base := c.cfg.HTTPTimeout()
+	if base < 10*time.Second {
+		return base
+	}
+	switch attempt {
+	case 0:
+		return 6 * time.Second
+	case 1:
+		return 8 * time.Second
+	default:
+		return base
+	}
+}
+
+func (c *Client) waitRetry(ctx context.Context, attempt int) error {
+	base := c.retryBaseDelay
+	if base <= 0 {
+		base = defaultRetryBaseDelay
+	}
+	delay := time.Duration(attempt) * base
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func isRetryableStatusCode(code int) bool {
+	if code == http.StatusRequestTimeout || code == http.StatusTooManyRequests {
+		return true
+	}
+	return code >= 500 && code <= 599
 }

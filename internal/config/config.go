@@ -17,7 +17,7 @@ const (
 	// DefaultReportIntervalSec 默认指标上报间隔（秒）。
 	DefaultReportIntervalSec = 10
 	// DefaultHTTPTimeoutSec 默认 HTTP 请求超时时间（秒）。
-	DefaultHTTPTimeoutSec = 10
+	DefaultHTTPTimeoutSec = 15
 	// MinReportIntervalSec 最小允许的上报间隔（秒）。
 	MinReportIntervalSec = 2
 	// MaxReportIntervalSec 最大允许的上报间隔（秒）。
@@ -49,7 +49,7 @@ func Default() *Config {
 	return &Config{
 		ReportIntervalSec: DefaultReportIntervalSec,
 		HTTPTimeoutSec:    DefaultHTTPTimeoutSec,
-		EnableGzip:        false,
+		EnableGzip:        true,
 		HostRoot:          "/",
 	}
 }

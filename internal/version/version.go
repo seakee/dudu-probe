@@ -8,7 +8,7 @@ import (
 
 var (
 	// Version 探针语义化版本号，编译时通过 -ldflags 注入。
-	Version = "1.0.0"
+	Version = "1.0.4"
 	// Commit Git 提交短哈希，编译时通过 -ldflags 注入。
 	Commit = "dev"
 	// BuildDate 构建时间（UTC），编译时通过 -ldflags 注入。

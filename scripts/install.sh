@@ -283,6 +283,16 @@ write_config() {
       chmod 0600 "$qcfg"
       ln -sf "$qcfg" "$CONFIG_FILE"
     fi
+    local upgrade_target="$CONFIG_FILE"
+    if [[ -n "$qcfg" && -f "$qcfg" ]]; then
+      upgrade_target="$qcfg"
+    fi
+    if sed -e 's/"http_timeout_sec": 10/"http_timeout_sec": 15/' -e 's/"enable_gzip": false/"enable_gzip": true/' "$upgrade_target" >"${upgrade_target}.tmp" 2>/dev/null; then
+      mv -f "${upgrade_target}.tmp" "$upgrade_target"
+      chmod 0600 "$upgrade_target"
+    else
+      rm -f "${upgrade_target}.tmp" 2>/dev/null || true
+    fi
     info "升级模式：保留现有配置文件 ${CONFIG_FILE}"
     return
   fi
@@ -320,9 +330,9 @@ write_config() {
   "node_key": "${esc_key}",
   "secret": "${esc_secret}",
   "report_interval_sec": ${INTERVAL},
-  "http_timeout_sec": 10,
+  "http_timeout_sec": 15,
   "insecure_tls": ${INSECURE},
-  "enable_gzip": false,
+  "enable_gzip": true,
   "host_root": "/"
 }
 EOF
