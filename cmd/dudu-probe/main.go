@@ -26,7 +26,7 @@ func main() {
 		nodeKey     = flag.String("key", "", "探针节点唯一标识 (node_key)")
 		secret      = flag.String("secret", "", "探针节点通信密钥 (secret)")
 		intervalSec = flag.Int("interval", 0, "指标上报间隔秒数 (默认 10)")
-		timeoutSec  = flag.Int("timeout", 0, "HTTP 请求超时秒数 (默认 10)")
+		timeoutSec  = flag.Int("timeout", 0, "HTTP 请求超时秒数 (默认 15)")
 		insecureTLS = flag.Bool("insecure", false, "跳过 HTTPS TLS 证书校验")
 		enableGzip  = flag.Bool("gzip", false, "启用上报请求 Gzip 压缩")
 		onceMode    = flag.Bool("once", false, "仅执行单次采集与上报后退出")
