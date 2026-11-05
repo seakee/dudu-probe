@@ -45,12 +45,22 @@ const (
 	defaultIdleConn       = 25 * time.Second
 )
 
+// PingTargetSpec 服务端下发的单条 TCP 拨测目标（目标地址已由服务端解析为 host:port）。
+type PingTargetSpec struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Target string `json:"target"`
+}
+
 // ServerConfigAck 服务端在注册或心跳响应中下发的动态配置。
 type ServerConfigAck struct {
-	NodeID            uint   `json:"node_id"`
-	ReportIntervalSec int    `json:"report_interval_sec"`
-	ServerTime        int64  `json:"server_time"`
-	Status            string `json:"status"`
+	NodeID            uint             `json:"node_id"`
+	ReportIntervalSec int              `json:"report_interval_sec"`
+	ServerTime        int64            `json:"server_time"`
+	Status            string           `json:"status"`
+	TargetVersion     string           `json:"target_version,omitempty"`
+	MirrorURL         string           `json:"mirror_url,omitempty"`
+	PingTargets       []PingTargetSpec `json:"ping_targets,omitempty"`
 }
 
 // apiEnvelope 对应 dudu 标准 JSON 响应结构。

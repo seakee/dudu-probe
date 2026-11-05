@@ -29,6 +29,37 @@ type DiskPartitionStat struct {
 	UsagePercent float64 `json:"usage_percent"` // 使用率百分比
 }
 
+// ProcessStat 定义高资源占用进程的快照信息。
+type ProcessStat struct {
+	PID        int32   `json:"pid"`         // 进程 PID
+	Name       string  `json:"name"`        // 进程名称
+	CPUPercent float64 `json:"cpu_percent"` // CPU 占用百分比
+	MemPercent float64 `json:"mem_percent"` // 内存占用百分比
+	MemRSS     uint64  `json:"mem_rss"`     // 常驻物理内存（字节）
+}
+
+// SensorTemp 定义单个硬件温度传感器读数。
+type SensorTemp struct {
+	Key         string  `json:"key"`         // 传感器名称
+	Temperature float64 `json:"temperature"` // 温度值（摄氏度 °C）
+}
+
+// PingTarget 定义服务端下发的单条 TCP 拨测目标。
+type PingTarget struct {
+	ID     string `json:"id"`     // 目标唯一标识
+	Name   string `json:"name"`   // 目标显示名称（如 广东电信 / 北京联通）
+	Target string `json:"target"` // 目标地址 host:port
+}
+
+// PingStat 定义单条 TCP 拨测目标的延迟与丢包统计结果。
+type PingStat struct {
+	ID        string  `json:"id"`         // 目标唯一标识
+	Name      string  `json:"name"`       // 目标显示名称
+	Target    string  `json:"target"`     // 实际拨测地址 host:port
+	LatencyMs float64 `json:"latency_ms"` // 平均握手延迟（毫秒）
+	LossRate  float64 `json:"loss_rate"`  // 丢包率百分比 (0-100)
+}
+
 // MetricPayload 定义探针单次上报的实时指标数据。
 type MetricPayload struct {
 	SampledAt         int64               `json:"sampled_at"`          // 采样 Unix 时间戳（秒）
@@ -56,7 +87,11 @@ type MetricPayload struct {
 	UDPConns          int                 `json:"udp_conns"`           // 活跃 UDP 连接数
 	ProcessCount      int                 `json:"process_count"`       // 运行进程数
 	UptimeSec         uint64              `json:"uptime_sec"`          // 系统运行时长（秒）
-	DiskPartitions    []DiskPartitionStat `json:"disk_partitions"`     // 各磁盘挂载点明细
+	DiskPartitions    []DiskPartitionStat `json:"disk_partitions"`         // 各磁盘挂载点明细
+	CPUTemp           float64             `json:"cpu_temp,omitempty"`      // CPU 主温度（摄氏度 °C）
+	Temperatures      []SensorTemp        `json:"temperatures,omitempty"`  // 硬件温度传感器明细
+	TopProcesses      []ProcessStat       `json:"top_processes,omitempty"` // 资源占用 Top 5 进程列表
+	PingResults       []PingStat          `json:"ping_results,omitempty"`  // 多目标 TCP Ping 拨测结果
 }
 
 // ReportRequest 定义上报给服务端的完整请求报文。

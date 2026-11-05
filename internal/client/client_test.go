@@ -12,6 +12,7 @@ import (
 	"time"
 	"github.com/seakee/dudu-probe/internal/collector"
 	"github.com/seakee/dudu-probe/internal/config"
+	"github.com/seakee/dudu-probe/internal/version"
 )
 
 func TestRegisterAndReportSignature(t *testing.T) {
@@ -180,6 +181,71 @@ func TestRetryOnCloudflare52xAndGzipPayload(t *testing.T) {
 	}
 	if ack == nil || ack.NodeID != 8 {
 		t.Fatalf("unexpected ack: %+v", ack)
+	}
+}
+
+func TestReportAckCarriesUpgradeAndPingTargets(t *testing.T) {
+	var gotUserAgent string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUserAgent = r.Header.Get("User-Agent")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"code": 0,
+			"msg":  "ok",
+			"data": map[string]any{
+				"node_id":             9,
+				"report_interval_sec": 10,
+				"status":              "online",
+				"target_version":      "v1.1.0",
+				"mirror_url":          "https://ghfast.top",
+				"ping_targets": []map[string]any{
+					{"id": "ct-gd", "name": "广东电信", "target": "gd.189.cn:443"},
+					{"id": "cu-bj", "name": "北京联通", "target": "111.201.97.116:4433"},
+				},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.ServerURL = srv.URL
+	cfg.NodeKey = "probe_ack_key"
+	cfg.Secret = "sec_ack_secret"
+
+	cli := New(cfg)
+	ack, err := cli.Report(context.Background(), &collector.ReportRequest{
+		Metrics: &collector.MetricPayload{
+			SampledAt: 1700000200,
+			CPUUsage:  12.5,
+			CPUTemp:   52.3,
+			Temperatures: []collector.SensorTemp{
+				{Key: "cpu-thermal", Temperature: 52.3},
+			},
+			TopProcesses: []collector.ProcessStat{
+				{PID: 1234, Name: "ffmpeg", CPUPercent: 42.1, MemPercent: 8.5, MemRSS: 512 << 20},
+			},
+			PingResults: []collector.PingStat{
+				{ID: "ct-gd", Name: "广东电信", Target: "gd.189.cn:443", LatencyMs: 168.4, LossRate: 0},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Report failed: %v", err)
+	}
+	if ack == nil {
+		t.Fatal("expected non-nil ack")
+	}
+	if ack.TargetVersion != "v1.1.0" || ack.MirrorURL != "https://ghfast.top" {
+		t.Fatalf("unexpected upgrade payload in ack: %+v", ack)
+	}
+	if len(ack.PingTargets) != 2 {
+		t.Fatalf("expected 2 ping targets, got %+v", ack.PingTargets)
+	}
+	if ack.PingTargets[1].Name != "北京联通" || ack.PingTargets[1].Target != "111.201.97.116:4433" {
+		t.Fatalf("unexpected ping target: %+v", ack.PingTargets[1])
+	}
+	if gotUserAgent != "dudu-probe/"+version.Version {
+		t.Fatalf("unexpected user agent: %q", gotUserAgent)
 	}
 }
 

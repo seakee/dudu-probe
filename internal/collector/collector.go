@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -20,6 +21,7 @@ import (
 	"github.com/shirou/gopsutil/v3/load"
 	"github.com/shirou/gopsutil/v3/mem"
 	gnet "github.com/shirou/gopsutil/v3/net"
+	"github.com/shirou/gopsutil/v3/process"
 )
 
 // Collector 负责采集当前主机静态元信息与动态实时指标。
@@ -35,6 +37,12 @@ type Collector struct {
 	prevNetOutBytes uint64
 	prevDiskRead    uint64
 	prevDiskWrite   uint64
+
+	prevProcCPU  map[int32]float64
+	prevProcTime time.Time
+
+	pingMu      sync.RWMutex
+	pingTargets []PingTarget
 }
 
 // New 创建并初始化采集器实例。
@@ -68,8 +76,15 @@ func (c *Collector) CollectHostMeta(ctx context.Context, forceRefresh bool) *Hos
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	privIP, pubIP := detectHostIPs()
 	if !forceRefresh && c.cachedMeta != nil && time.Since(c.lastMetaRefresh) < 5*time.Minute {
 		cp := *c.cachedMeta
+		if privIP != "" {
+			cp.PrivateIP = privIP
+		}
+		if pubIP != "" {
+			cp.PublicIP = pubIP
+		}
 		return &cp
 	}
 
@@ -78,7 +93,8 @@ func (c *Collector) CollectHostMeta(ctx context.Context, forceRefresh bool) *Hos
 		Arch:         runtime.GOARCH,
 		CPUCores:     runtime.NumCPU(),
 		AgentVersion: version.Version,
-		PrivateIP:    detectPrivateIP(),
+		PrivateIP:    privIP,
+		PublicIP:     pubIP,
 	}
 
 	if hInfo, err := host.InfoWithContext(ctx); err == nil && hInfo != nil {
@@ -235,6 +251,17 @@ func (c *Collector) CollectMetrics(ctx context.Context) (*MetricPayload, error) 
 	if udpConns, err := gnet.ConnectionsWithContext(ctx, "udp"); err == nil {
 		payload.UDPConns = len(udpConns)
 	}
+
+	// 8. 硬件温度传感器采集
+	cpuTemp, temps := collectTemperatures(ctx, c.hostRoot)
+	payload.CPUTemp = cpuTemp
+	payload.Temperatures = temps
+
+	// 9. Top 5 高占用进程快照
+	payload.TopProcesses = c.collectTopProcesses(ctx, payload.MemTotal)
+
+	// 10. 多目标并发 TCP Ping 测速
+	payload.PingResults = c.collectPingResults(ctx)
 
 	return payload, nil
 }
@@ -469,25 +496,45 @@ func readDiskIOTotals(ctx context.Context) (readBytes, writeBytes uint64) {
 	return readBytes, writeBytes
 }
 
-// detectPrivateIP 自动探测本机主要内网 IPv4 地址。
-func detectPrivateIP() string {
+// detectHostIPs 自动探测并区分本机主要内网 IPv4 (RFC1918/CGNAT) 与网卡/拨号公网 IPv4。
+//
+// 返回值:
+//
+//	privateIP: 优先取默认路由出口或 br-lan 上的私网/CGNAT 地址
+//	publicIP:  优先取默认路由出口或物理网卡上的全局单播公网地址
+func detectHostIPs() (privateIP, publicIP string) {
+	hardPrivate := false
+
 	conn, err := net.DialTimeout("udp", "8.8.8.8:80", 500*time.Millisecond)
 	if err == nil {
 		defer conn.Close()
 		if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok && addr.IP != nil {
-			return addr.IP.String()
+			if ipv4 := addr.IP.To4(); ipv4 != nil && !ipv4.IsLoopback() {
+				switch {
+				case ipv4.IsPrivate():
+					privateIP = ipv4.String()
+					hardPrivate = true
+				case isPrivateOrCarrierNAT(ipv4):
+					// TUN/代理网卡常见 198.18.0.0/15、100.64.0.0/10，先记录但允许被真实局域网地址覆盖
+					privateIP = ipv4.String()
+				case ipv4.IsGlobalUnicast():
+					publicIP = ipv4.String()
+				}
+			}
 		}
 	}
 
 	ifaces, err := net.Interfaces()
 	if err != nil {
-		return ""
+		return privateIP, publicIP
 	}
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
 		}
-		if ShouldIgnoreNetInterface(iface.Name) {
+		// br-lan 承载 OpenWrt 等软路由的局域网网关地址，需显式保留
+		isLanBridge := strings.EqualFold(strings.TrimSpace(iface.Name), "br-lan")
+		if !isLanBridge && ShouldIgnoreNetInterface(iface.Name) {
 			continue
 		}
 		addrs, err := iface.Addrs()
@@ -502,15 +549,290 @@ func detectPrivateIP() string {
 			case *net.IPAddr:
 				ip = v.IP
 			}
-			if ip == nil || ip.IsLoopback() {
+			if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
 				continue
 			}
-			if ipv4 := ip.To4(); ipv4 != nil {
-				return ipv4.String()
+			ipv4 := ip.To4()
+			if ipv4 == nil {
+				continue
+			}
+			switch {
+			case ipv4.IsPrivate():
+				// 真实局域网地址优先级最高；br-lan 网关地址覆盖同网段其他网卡
+				if !hardPrivate || isLanBridge {
+					privateIP = ipv4.String()
+					hardPrivate = true
+				}
+			case isPrivateOrCarrierNAT(ipv4):
+				if privateIP == "" {
+					privateIP = ipv4.String()
+				}
+			case ipv4.IsGlobalUnicast() && publicIP == "":
+				publicIP = ipv4.String()
 			}
 		}
 	}
-	return ""
+	return privateIP, publicIP
+}
+
+// isPrivateOrCarrierNAT 判断 IPv4 是否属于私网、回环、链路本地、运营商级 NAT 或基准测试网段。
+func isPrivateOrCarrierNAT(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+		return true
+	}
+	if ipv4 := ip.To4(); ipv4 != nil {
+		// RFC 6598 运营商级 NAT (100.64.0.0/10)
+		if ipv4[0] == 100 && ipv4[1] >= 64 && ipv4[1] <= 127 {
+			return true
+		}
+		// RFC 2544 基准测试保留段 (198.18.0.0/15)，常见于代理软件 TUN 网卡
+		if ipv4[0] == 198 && (ipv4[1] == 18 || ipv4[1] == 19) {
+			return true
+		}
+	}
+	return false
+}
+
+// collectTemperatures 采集主机硬件温度传感器读数。
+//
+// 参数:
+//   ctx: 上下文对象
+//   hostRoot: 容器挂载的宿主机根目录
+//
+// 返回值:
+//   float64: 主 CPU 温度（摄氏度），无传感器时为 0
+//   []SensorTemp: 最多 8 条传感器明细
+func collectTemperatures(ctx context.Context, hostRoot string) (float64, []SensorTemp) {
+	var list []SensorTemp
+	seen := make(map[string]bool)
+
+	if stats, err := host.SensorsTemperaturesWithContext(ctx); err == nil {
+		for _, st := range stats {
+			if st.Temperature <= 0 || st.Temperature >= 150 || math.IsNaN(st.Temperature) {
+				continue
+			}
+			key := strings.TrimSpace(st.SensorKey)
+			if key == "" || seen[key] {
+				continue
+			}
+			seen[key] = true
+			list = append(list, SensorTemp{
+				Key:         key,
+				Temperature: round2(st.Temperature),
+			})
+		}
+	}
+
+	// Linux sysfs 兜底读取（/sys/class/thermal/thermal_zone*），覆盖 OpenWrt 等无 hwmon 的固件
+	if len(list) == 0 && runtime.GOOS == "linux" {
+		sysBase := "/sys/class/thermal"
+		if hostRoot != "" && hostRoot != "/" {
+			alt := filepath.Join(hostRoot, "sys/class/thermal")
+			if _, err := os.Stat(alt); err == nil {
+				sysBase = alt
+			}
+		}
+		if matches, err := filepath.Glob(filepath.Join(sysBase, "thermal_zone*")); err == nil {
+			for _, zoneDir := range matches {
+				rawTemp, err := os.ReadFile(filepath.Join(zoneDir, "temp"))
+				if err != nil {
+					continue
+				}
+				val, err := strconv.ParseFloat(strings.TrimSpace(string(rawTemp)), 64)
+				if err != nil || val <= 0 {
+					continue
+				}
+				// 内核以毫摄氏度上报
+				if val > 200 {
+					val = val / 1000.0
+				}
+				if val <= 0 || val >= 150 {
+					continue
+				}
+				zoneKey := filepath.Base(zoneDir)
+				if rawType, tErr := os.ReadFile(filepath.Join(zoneDir, "type")); tErr == nil {
+					if t := strings.TrimSpace(string(rawType)); t != "" {
+						zoneKey = t
+					}
+				}
+				if seen[zoneKey] {
+					continue
+				}
+				seen[zoneKey] = true
+				list = append(list, SensorTemp{
+					Key:         zoneKey,
+					Temperature: round2(val),
+				})
+			}
+		}
+	}
+
+	if len(list) == 0 {
+		return 0, nil
+	}
+
+	var cpuTemp, maxTemp float64
+	for _, item := range list {
+		if item.Temperature > maxTemp {
+			maxTemp = item.Temperature
+		}
+		k := strings.ToLower(item.Key)
+		if strings.Contains(k, "cpu") || strings.Contains(k, "package") ||
+			strings.Contains(k, "coretemp") || strings.Contains(k, "k10temp") ||
+			strings.Contains(k, "soc") || strings.Contains(k, "x86_pkg") {
+			if item.Temperature > cpuTemp {
+				cpuTemp = item.Temperature
+			}
+		}
+	}
+	if cpuTemp == 0 {
+		cpuTemp = maxTemp
+	}
+	if len(list) > 8 {
+		list = list[:8]
+	}
+	return round2(cpuTemp), list
+}
+
+// collectTopProcesses 采集当前 CPU/内存综合占用最高的前 5 个进程快照。
+//
+// 参数:
+//   ctx: 上下文对象
+//   memTotal: 物理内存总量（字节），用于换算进程内存占比
+//
+// 返回值:
+//   []ProcessStat: 最多 5 条进程快照，采集失败时返回 nil
+func (c *Collector) collectTopProcesses(ctx context.Context, memTotal uint64) []ProcessStat {
+	now := time.Now()
+	elapsed := now.Sub(c.prevProcTime).Seconds()
+
+	// macOS 在 CGO_ENABLED=0 下 gopsutil 无法读取进程 CPU 时间，直接走 ps 兜底
+	if runtime.GOOS == "darwin" {
+		return collectTopProcessesViaPS(ctx)
+	}
+
+	procs, err := process.ProcessesWithContext(ctx)
+	if err != nil || len(procs) == 0 {
+		return collectTopProcessesViaPS(ctx)
+	}
+
+	cores := float64(runtime.NumCPU())
+	if cores < 1 {
+		cores = 1
+	}
+	nextCPU := make(map[int32]float64, len(procs))
+	candidates := make([]ProcessStat, 0, 64)
+
+	for _, p := range procs {
+		if p == nil || p.Pid <= 0 {
+			continue
+		}
+		var rawCPUPct float64
+		if times, tErr := p.TimesWithContext(ctx); tErr == nil && times != nil {
+			totalSec := times.User + times.System
+			nextCPU[p.Pid] = totalSec
+			if c.prevProcCPU != nil && elapsed >= 0.2 {
+				if prevSec, ok := c.prevProcCPU[p.Pid]; ok && totalSec >= prevSec {
+					rawCPUPct = ((totalSec - prevSec) / elapsed) * 100.0
+				}
+			}
+		}
+		var rss uint64
+		if memInfo, mErr := p.MemoryInfoWithContext(ctx); mErr == nil && memInfo != nil {
+			rss = memInfo.RSS
+		}
+		// 跳过明显空闲的进程，减少后续 Name 系统调用
+		if rawCPUPct < 0.1 && rss < (4<<20) {
+			continue
+		}
+		name, nErr := p.NameWithContext(ctx)
+		if nErr != nil {
+			continue
+		}
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		var memPct float64
+		if memTotal > 0 && rss > 0 {
+			memPct = float64(rss) * 100.0 / float64(memTotal)
+		}
+		candidates = append(candidates, ProcessStat{
+			PID:        p.Pid,
+			Name:       name,
+			CPUPercent: round2(clampPercent(rawCPUPct / cores)),
+			MemPercent: round2(clampPercent(memPct)),
+			MemRSS:     rss,
+		})
+	}
+
+	c.prevProcCPU = nextCPU
+	c.prevProcTime = now
+
+	if len(candidates) == 0 {
+		return collectTopProcessesViaPS(ctx)
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if math.Abs(candidates[i].CPUPercent-candidates[j].CPUPercent) > 0.5 {
+			return candidates[i].CPUPercent > candidates[j].CPUPercent
+		}
+		return candidates[i].MemRSS > candidates[j].MemRSS
+	})
+	if len(candidates) > 5 {
+		candidates = candidates[:5]
+	}
+	return candidates
+}
+
+// collectTopProcessesViaPS 通过 ps 命令兜底采集 Top 5 进程（macOS 及 gopsutil 不可用时）。
+func collectTopProcessesViaPS(ctx context.Context) []ProcessStat {
+	out, err := exec.CommandContext(ctx, "ps", "-A", "-o", "pid,%cpu,%mem,rss,comm").Output()
+	if err != nil {
+		return nil
+	}
+	cores := float64(runtime.NumCPU())
+	if cores < 1 {
+		cores = 1
+	}
+	lines := strings.Split(string(out), "\n")
+	list := make([]ProcessStat, 0, len(lines))
+	for _, line := range lines {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) < 5 || fields[0] == "PID" {
+			continue
+		}
+		pid, pErr := strconv.ParseInt(fields[0], 10, 32)
+		if pErr != nil || pid <= 0 {
+			continue
+		}
+		cpuPct, _ := strconv.ParseFloat(fields[1], 64)
+		memPct, _ := strconv.ParseFloat(fields[2], 64)
+		rssKB, _ := strconv.ParseUint(fields[3], 10, 64)
+		name := filepath.Base(strings.Join(fields[4:], " "))
+		if name == "" {
+			continue
+		}
+		list = append(list, ProcessStat{
+			PID:        int32(pid),
+			Name:       name,
+			CPUPercent: round2(clampPercent(cpuPct / cores)),
+			MemPercent: round2(clampPercent(memPct)),
+			MemRSS:     rssKB * 1024,
+		})
+	}
+	sort.Slice(list, func(i, j int) bool {
+		if math.Abs(list[i].CPUPercent-list[j].CPUPercent) > 0.5 {
+			return list[i].CPUPercent > list[j].CPUPercent
+		}
+		return list[i].MemRSS > list[j].MemRSS
+	})
+	if len(list) > 5 {
+		list = list[:5]
+	}
+	return list
 }
 
 func clampPercent(v float64) float64 {

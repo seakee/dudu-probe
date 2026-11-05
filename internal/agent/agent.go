@@ -17,6 +17,7 @@ type Agent struct {
 	collector *collector.Collector
 	client    *client.Client
 	logger    *log.Logger
+	upgrader  *Upgrader
 }
 
 // New 创建探针 Agent 实例。
@@ -29,6 +30,28 @@ func New(cfg *config.Config, col *collector.Collector, cli *client.Client, logge
 		collector: col,
 		client:    cli,
 		logger:    logger,
+		upgrader:  NewUpgrader(logger),
+	}
+}
+
+// applyAck 应用服务端下发的动态配置（拨测目标、目标版本）。
+func (a *Agent) applyAck(ack *client.ServerConfigAck) {
+	if ack == nil {
+		return
+	}
+	if a.collector != nil {
+		targets := make([]collector.PingTarget, 0, len(ack.PingTargets))
+		for _, t := range ack.PingTargets {
+			targets = append(targets, collector.PingTarget{
+				ID:     t.ID,
+				Name:   t.Name,
+				Target: t.Target,
+			})
+		}
+		a.collector.SetPingTargets(targets)
+	}
+	if a.upgrader != nil {
+		a.upgrader.MaybeUpgrade(ack.TargetVersion, ack.MirrorURL)
 	}
 }
 
@@ -52,6 +75,7 @@ func (a *Agent) Run(ctx context.Context) error {
 				a.logger.Printf("[dudu-probe] 同步服务端下发上报间隔: %s", interval)
 			}
 		}
+		a.applyAck(ack)
 	}
 
 	// 2. 立即执行一次指标上报
@@ -98,6 +122,7 @@ func (a *Agent) reportOnce(ctx context.Context, currentInterval time.Duration) t
 		a.logger.Printf("[dudu-probe] 指标上报失败: %v", err)
 		return currentInterval
 	}
+	a.applyAck(ack)
 	if ack != nil && ack.ReportIntervalSec > 0 {
 		next := time.Duration(config.ClampInterval(ack.ReportIntervalSec)) * time.Second
 		return next
