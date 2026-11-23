@@ -130,18 +130,24 @@ func buildUpgradeCommand(target, mirrorURL string) string {
 	}
 
 	var sb strings.Builder
-	sb.WriteString("curl -fsSL ")
+	sb.WriteString("tmp_script=$(mktemp) && trap 'rm -f \"$tmp_script\"' EXIT && ")
 	if mirror != "" {
+		sb.WriteString("(curl -fsSL ")
 		sb.WriteString(shellQuote(mirror + "/" + scriptURL))
-	} else {
+		sb.WriteString(" -o \"$tmp_script\" || curl -fsSL ")
 		sb.WriteString(shellQuote(scriptURL))
+		sb.WriteString(" -o \"$tmp_script\") && ")
+	} else {
+		sb.WriteString("curl -fsSL ")
+		sb.WriteString(shellQuote(scriptURL))
+		sb.WriteString(" -o \"$tmp_script\" && ")
 	}
-	sb.WriteString(" | ")
+	sb.WriteString("[ -s \"$tmp_script\" ] && ")
 	if os.Geteuid() != 0 {
 		// 非 root 场景（如 QNAP admin 账号）需要免密 sudo，失败则直接报错退出
 		sb.WriteString("sudo -n ")
 	}
-	sb.WriteString("bash -s -- ")
+	sb.WriteString("bash \"$tmp_script\" ")
 	if mirror != "" {
 		sb.WriteString("--mirror ")
 		sb.WriteString(shellQuote(mirror))

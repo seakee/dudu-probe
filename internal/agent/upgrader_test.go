@@ -85,6 +85,9 @@ func TestBuildUpgradeCommand(t *testing.T) {
 	if !strings.Contains(withMirror, "ghfast.top/https://raw.githubusercontent.com/seakee/dudu-probe/main/scripts/install.sh") {
 		t.Fatalf("expected mirrored script url, got %q", withMirror)
 	}
+	if !strings.Contains(withMirror, "|| curl -fsSL 'https://raw.githubusercontent.com/seakee/dudu-probe/main/scripts/install.sh'") {
+		t.Fatalf("expected direct github fallback url, got %q", withMirror)
+	}
 	if !strings.Contains(withMirror, "--mirror 'https://ghfast.top'") {
 		t.Fatalf("expected mirror flag, got %q", withMirror)
 	}
@@ -101,6 +104,9 @@ func TestBuildUpgradeCommand(t *testing.T) {
 	}
 	if !strings.Contains(plain, "raw.githubusercontent.com/seakee/dudu-probe") {
 		t.Fatalf("expected official script url, got %q", plain)
+	}
+	if !strings.Contains(plain, "bash \"$tmp_script\"") {
+		t.Fatalf("expected buffered script execution instead of unguarded curl|bash pipe, got %q", plain)
 	}
 
 	// 非法镜像地址必须被丢弃，避免命令注入
@@ -306,5 +312,71 @@ func TestRunWithTimeoutParentCancel(t *testing.T) {
 	_, err = runWithTimeout(canceledCtx, 5*time.Second, os.Args[0], "-test.run=^TestHelperRunWithTimeoutProcess$")
 	if err == nil || err == errUpgradeTimeout {
 		t.Fatalf("expected context cancellation error, got %v", err)
+	}
+}
+
+func TestBuildUpgradeCommandExecutionAndFallback(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell test only")
+	}
+
+	tmpDir := t.TempDir()
+	logFile := tmpDir + "/calls.log"
+	curlStub := tmpDir + "/curl"
+	sudoStub := tmpDir + "/sudo"
+
+	// curl 仅在直连（不含 bad-mirror）时成功输出合法脚本
+	curlScript := fmt.Sprintf(`#!/usr/bin/env bash
+set -euo pipefail
+out=""
+url=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+echo "curl:$url" >> %q
+if [[ "$url" == *"bad-mirror.example"* ]]; then
+  exit 35
+fi
+cat >"$out" <<'SCRIPT'
+#!/usr/bin/env bash
+echo "ran:$*" >> %q
+SCRIPT
+`, logFile, logFile)
+	if err := os.WriteFile(curlStub, []byte(curlScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sudoScript := "#!/usr/bin/env bash\nif [[ \"${1:-}\" == \"-n\" ]]; then shift; fi\nexec \"$@\"\n"
+	if err := os.WriteFile(sudoStub, []byte(sudoScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("PATH", tmpDir+":"+os.Getenv("PATH"))
+	cmd := buildUpgradeCommand("v1.2.0", "https://bad-mirror.example")
+	out, err := runWithTimeout(context.Background(), 5*time.Second, "sh", "-c", cmd)
+	if err != nil {
+		t.Fatalf("expected fallback execution to succeed, got %v (out=%q)", err, string(out))
+	}
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logged := string(data)
+	if !strings.Contains(logged, "curl:https://bad-mirror.example/https://raw.githubusercontent.com") ||
+		!strings.Contains(logged, "curl:https://raw.githubusercontent.com") ||
+		!strings.Contains(logged, "ran:--mirror https://bad-mirror.example --version v1.2.0 upgrade") {
+		t.Fatalf("unexpected fallback execution log:\n%s", logged)
+	}
+
+	// 若镜像与直连全部失败，必须返回非零错误（不再被 curl|bash 空管道吞掉）
+	failCurl := "#!/usr/bin/env bash\nexit 22\n"
+	if err := os.WriteFile(curlStub, []byte(failCurl), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runWithTimeout(context.Background(), 5*time.Second, "sh", "-c", cmd); err == nil {
+		t.Fatal("expected non-zero error when both mirror and direct curl fail")
 	}
 }
