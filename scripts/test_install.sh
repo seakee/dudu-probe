@@ -204,6 +204,7 @@ chmod 0755 "${MIRROR_TEST_ROOT}/etc/init.d/dudu-probe"
 
 OPENWRT_INSTALL="${MIRROR_TEST_ROOT}/install-openwrt.sh"
 sed \
+  -e "s|/run/systemd/system|${MIRROR_TEST_ROOT}/no-systemd|g" \
   -e "s|/etc/rc.common|${MIRROR_TEST_ROOT}/etc/rc.common|g" \
   -e "s|-d /etc/init.d|-d ${MIRROR_TEST_ROOT}/etc/init.d|g" \
   -e "s|^INSTALL_BIN=.*|INSTALL_BIN=\"${MIRROR_TEST_ROOT}/usr/local/bin/dudu-probe\"|" \
@@ -223,3 +224,46 @@ if grep -q "^stop$" "${OPENWRT_LOG}"; then
 fi
 grep -q "^restart$" "${OPENWRT_LOG}"
 test -x "${MIRROR_TEST_ROOT}/usr/local/bin/dudu-probe"
+
+# Verify systemd upgrade writes KillMode=process, avoids stop_service, and restarts via systemd-run in service cgroup
+SYSTEMD_TEST_ROOT="$(mktemp -d)"
+trap 'rm -rf "${TEST_ROOT}" "${MIRROR_TEST_ROOT}" "${SYSTEMD_TEST_ROOT}"' EXIT
+mkdir -p "${SYSTEMD_TEST_ROOT}/bin" "${SYSTEMD_TEST_ROOT}/run/systemd/system" "${SYSTEMD_TEST_ROOT}/etc/systemd/system" "${SYSTEMD_TEST_ROOT}/etc/dudu-probe" "${SYSTEMD_TEST_ROOT}/usr/local/bin" "${SYSTEMD_TEST_ROOT}/tmp"
+cp "${MIRROR_TEST_ROOT}/bin/uname" "${MIRROR_TEST_ROOT}/bin/id" "${MIRROR_TEST_ROOT}/bin/curl" "${FAKE_BIN}/tr" "${FAKE_BIN}/install" "${SYSTEMD_TEST_ROOT}/bin/"
+SYSTEMD_LOG="${SYSTEMD_TEST_ROOT}/systemd.log"
+cat >"${SYSTEMD_TEST_ROOT}/bin/systemctl" <<EOF
+#!/usr/bin/env bash
+echo "systemctl \$*" >>"${SYSTEMD_LOG}"
+exit 0
+EOF
+cat >"${SYSTEMD_TEST_ROOT}/bin/systemd-run" <<EOF
+#!/usr/bin/env bash
+echo "systemd-run \$*" >>"${SYSTEMD_LOG}"
+exit 0
+EOF
+chmod 0755 "${SYSTEMD_TEST_ROOT}/bin/systemctl" "${SYSTEMD_TEST_ROOT}/bin/systemd-run"
+cat >"${SYSTEMD_TEST_ROOT}/etc/dudu-probe/config.json" <<'EOF'
+{"server_url":"http://127.0.0.1:8000","node_key":"k","secret":"s"}
+EOF
+echo "0::/system.slice/dudu-probe.service" >"${SYSTEMD_TEST_ROOT}/cgroup"
+SYSTEMD_INSTALL="${SYSTEMD_TEST_ROOT}/install-systemd.sh"
+sed \
+  -e "s|/run/systemd/system|${SYSTEMD_TEST_ROOT}/run/systemd/system|g" \
+  -e "s|/proc/self/cgroup|${SYSTEMD_TEST_ROOT}/cgroup|g" \
+  -e "s|^INSTALL_BIN=.*|INSTALL_BIN=\"${SYSTEMD_TEST_ROOT}/usr/local/bin/dudu-probe\"|" \
+  -e "s|^CONFIG_DIR=.*|CONFIG_DIR=\"${SYSTEMD_TEST_ROOT}/etc/dudu-probe\"|" \
+  -e "s|^SYSTEMD_UNIT=.*|SYSTEMD_UNIT=\"${SYSTEMD_TEST_ROOT}/etc/systemd/system/dudu-probe.service\"|" \
+  -e 's|\${EUID:-\$(id -u)}|\$(id -u)|' \
+  "${INSTALL_SH}" >"${SYSTEMD_INSTALL}"
+chmod 0755 "${SYSTEMD_INSTALL}"
+
+PATH="${SYSTEMD_TEST_ROOT}/bin:${PATH}" TMPDIR="${SYSTEMD_TEST_ROOT}/tmp" \
+  bash "${SYSTEMD_INSTALL}" upgrade --version "v1.0.0"
+
+grep -q "^KillMode=process$" "${SYSTEMD_TEST_ROOT}/etc/systemd/system/dudu-probe.service"
+if grep -q "systemctl stop dudu-probe" "${SYSTEMD_LOG}"; then
+  echo "expected systemd upgrade not to invoke systemctl stop before binary swap" >&2
+  exit 1
+fi
+grep -q "^systemd-run --quiet systemctl restart dudu-probe$" "${SYSTEMD_LOG}"
+test -x "${SYSTEMD_TEST_ROOT}/usr/local/bin/dudu-probe"
