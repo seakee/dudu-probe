@@ -12,6 +12,7 @@
   - **实时性能指标**：CPU 使用率、系统平均负载（1/5/15 分钟）、内存与 Swap 使用率、各真实磁盘挂载点使用率与读写速率、实时上下行网速与累计总流量、TCP/UDP 连接数、进程数、在线时长。
   - **硬件与进程洞察**：CPU 主温度与最多 8 个温度传感器读数、CPU 占用 Top 5 进程快照（PID / 进程名 / CPU% / 内存% / RSS）。
   - **网络质量拨测**：并发对服务端下发的拨测目标（三网公共节点、家宽动态 IP、Cloudflare 等）执行轻量 TCP Ping，上报握手延迟与丢包率。
+  - **OCI IPv6 自动观测**：在 Linux OCI 实例上于启动时及每 60 秒独立采样 IMDSv2（`/opc/v2/vnics/`，2 秒超时直连且忽略代理环境变量与重定向），基于主 VNIC MAC 匹配本机网卡并校验公网非临时、非 tentative/DAD-failed IPv6 地址，通过心跳 `ipv6_observation` 上报（Docker 部署需保留 `--net=host`）；非 Linux 或非 OCI 环境自动安全跳过。
 - **服务端驱动的远程自升级**：心跳响应中的 `target_version` 高于本机版本时自动下载并平滑重启（支持镜像加速），无需开放入站端口或手动 SSH。
 - **安全签名通信**：每次请求均使用 `HMAC-SHA256(node_key + timestamp + body, secret)` 签名防篡改与防重放，支持 Gzip 压缩与服务端动态调整上报间隔。
 - **一键安装与常驻自启**：自动适配 `systemd`（Ubuntu/Debian/CentOS/Rocky/Arch）、`OpenRC`（Alpine）、`procd`（OpenWrt）与 `launchd`（macOS）。

@@ -44,7 +44,7 @@ func main() {
 
 	// 本地快速自检模式：无需服务端配置即可打印采集到的主机元信息与实时指标
 	if *inspectMode {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 		defer cancel()
 		col := collector.New(os.Getenv("HOST_ROOT"))
 		time.Sleep(200 * time.Millisecond)
@@ -53,9 +53,11 @@ func main() {
 		if err != nil {
 			logger.Fatalf("采集本机指标失败: %v", err)
 		}
+		ipv6Obs := col.CollectIPv6Observation(ctx, true)
 		out, _ := json.MarshalIndent(&collector.ReportRequest{
-			Host:    meta,
-			Metrics: metrics,
+			Host:            meta,
+			Metrics:         metrics,
+			IPv6Observation: ipv6Obs,
 		}, "", "  ")
 		fmt.Println(string(out))
 		return

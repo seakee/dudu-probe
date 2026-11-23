@@ -4,15 +4,15 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"github.com/seakee/dudu-probe/internal/collector"
+	"github.com/seakee/dudu-probe/internal/config"
+	"github.com/seakee/dudu-probe/internal/version"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
-	"github.com/seakee/dudu-probe/internal/collector"
-	"github.com/seakee/dudu-probe/internal/config"
-	"github.com/seakee/dudu-probe/internal/version"
 )
 
 func TestRegisterAndReportSignature(t *testing.T) {
@@ -272,5 +272,33 @@ func TestNoRetryOnUnauthorized(t *testing.T) {
 	}
 	if atomic.LoadInt32(&attempts) != 1 {
 		t.Fatalf("expected no retry on 401, got %d attempts", atomic.LoadInt32(&attempts))
+	}
+}
+
+func TestCanceledContextDoesNotSendRequest(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.ServerURL = srv.URL
+	cfg.NodeKey = "probe_cancel_key"
+	cfg.Secret = "sec_cancel_secret"
+	cli := New(cfg)
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := cli.Register(canceledCtx, &collector.HostMeta{Hostname: "h"}); err == nil {
+		t.Fatal("expected error on canceled Register")
+	}
+	if _, err := cli.Report(canceledCtx, &collector.ReportRequest{Metrics: &collector.MetricPayload{SampledAt: 1}}); err == nil {
+		t.Fatal("expected error on canceled Report")
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("expected 0 HTTP requests after context cancellation, got %d", hits.Load())
 	}
 }
