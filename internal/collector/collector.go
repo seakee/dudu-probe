@@ -41,8 +41,9 @@ type Collector struct {
 	prevProcCPU  map[int32]float64
 	prevProcTime time.Time
 
-	pingMu      sync.RWMutex
-	pingTargets []PingTarget
+	pingMu       sync.RWMutex
+	pingTargets  []PingTarget
+	ipv6Observer *ociIPv6Observer
 }
 
 // New 创建并初始化采集器实例。
@@ -51,7 +52,8 @@ func New(hostRoot string) *Collector {
 		hostRoot = "/"
 	}
 	c := &Collector{
-		hostRoot: hostRoot,
+		hostRoot:     hostRoot,
+		ipv6Observer: newOCIIPv6Observer(hostRoot),
 	}
 	// 预热一次计数基线，使首次正式采集即可获得较准确的瞬时速率
 	c.primeBaselines(context.Background())
@@ -73,8 +75,24 @@ func (c *Collector) primeBaselines(ctx context.Context) {
 
 // CollectHostMeta 采集主机静态硬件与操作系统元信息（带 5 分钟内存缓存）。
 func (c *Collector) CollectHostMeta(ctx context.Context, forceRefresh bool) *HostMeta {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if ctx.Err() != nil {
+		if c.cachedMeta != nil {
+			cp := *c.cachedMeta
+			return &cp
+		}
+		return &HostMeta{
+			OSName:       runtime.GOOS,
+			Arch:         runtime.GOARCH,
+			CPUCores:     runtime.NumCPU(),
+			AgentVersion: version.Version,
+		}
+	}
 
 	privIP, pubIP := detectHostIPs()
 	if !forceRefresh && c.cachedMeta != nil && time.Since(c.lastMetaRefresh) < 5*time.Minute {
@@ -96,7 +114,6 @@ func (c *Collector) CollectHostMeta(ctx context.Context, forceRefresh bool) *Hos
 		PrivateIP:    privIP,
 		PublicIP:     pubIP,
 	}
-
 	if hInfo, err := host.InfoWithContext(ctx); err == nil && hInfo != nil {
 		if hInfo.Platform != "" {
 			meta.OSName = hInfo.Platform
@@ -143,16 +160,35 @@ func (c *Collector) CollectHostMeta(ctx context.Context, forceRefresh bool) *Hos
 		}
 	}
 
-	c.cachedMeta = meta
-	c.lastMetaRefresh = time.Now()
+	if ctx.Err() == nil {
+		c.cachedMeta = meta
+		c.lastMetaRefresh = time.Now()
+	}
 	cp := *meta
 	return &cp
 }
 
+// CollectIPv6Observation 采集当前主机的 OCI IPv6 观测状态（独立于 HostMeta 5 分钟缓存，按 60 秒周期采样）。
+func (c *Collector) CollectIPv6Observation(ctx context.Context, forceRefresh bool) *IPv6Observation {
+	if c == nil || c.ipv6Observer == nil {
+		return nil
+	}
+	return c.ipv6Observer.Observe(ctx, forceRefresh)
+}
+
 // CollectMetrics 采集当前时刻的实时性能、磁盘、网络与连接数指标。
 func (c *Collector) CollectMetrics(ctx context.Context) (*MetricPayload, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	now := time.Now()
 	payload := &MetricPayload{
@@ -204,16 +240,22 @@ func (c *Collector) CollectMetrics(ctx context.Context) (*MetricPayload, error) 
 			select {
 			case <-ctx.Done():
 				timer.Stop()
+				return nil, ctx.Err()
 			case <-timer.C:
 			}
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	nowSample := time.Now()
 	netIn, netOut := readNetTotals(ctx)
 	diskRead, diskWrite := readDiskIOTotals(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	payload.NetInTotal = netIn
 	payload.NetOutTotal = netOut
-
 	if c.hasPrevSample {
 		elapsed := nowSample.Sub(c.lastSampleTime).Seconds()
 		if elapsed >= 0.1 {
@@ -261,7 +303,13 @@ func (c *Collector) CollectMetrics(ctx context.Context) (*MetricPayload, error) 
 	payload.TopProcesses = c.collectTopProcesses(ctx, payload.MemTotal)
 
 	// 10. 多目标并发 TCP Ping 测速
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	payload.PingResults = c.collectPingResults(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	return payload, nil
 }
@@ -364,33 +412,33 @@ func ShouldIgnorePartition(mountpoint, fstype, device string) bool {
 		return false
 	}
 	ignoredFS := map[string]bool{
-		"tmpfs":       true,
-		"devtmpfs":    true,
-		"devfs":       true,
-		"squashfs":    true,
-		"overlay":     true,
-		"overlayfs":   true,
-		"sysfs":       true,
-		"cgroup":      true,
-		"cgroup2":     true,
-		"nsfs":        true,
-		"autofs":      true,
-		"tracefs":     true,
-		"debugfs":     true,
-		"mqueue":      true,
+		"tmpfs":           true,
+		"devtmpfs":        true,
+		"devfs":           true,
+		"squashfs":        true,
+		"overlay":         true,
+		"overlayfs":       true,
+		"sysfs":           true,
+		"cgroup":          true,
+		"cgroup2":         true,
+		"nsfs":            true,
+		"autofs":          true,
+		"tracefs":         true,
+		"debugfs":         true,
+		"mqueue":          true,
 		"hugetlbfs":       true,
 		"fuse":            true,
 		"fuse.lxcfs":      true,
 		"fuse.hdsfusemnt": true,
 		"cmfs":            true,
 		"iso9660":         true,
-		"udf":         true,
-		"ramfs":       true,
-		"pstore":      true,
-		"securityfs":  true,
-		"configfs":    true,
-		"fusectl":     true,
-		"binfmt_misc": true,
+		"udf":             true,
+		"ramfs":           true,
+		"pstore":          true,
+		"securityfs":      true,
+		"configfs":        true,
+		"fusectl":         true,
+		"binfmt_misc":     true,
 	}
 	if ignoredFS[fs] {
 		return true
@@ -599,12 +647,14 @@ func isPrivateOrCarrierNAT(ip net.IP) bool {
 // collectTemperatures 采集主机硬件温度传感器读数。
 //
 // 参数:
-//   ctx: 上下文对象
-//   hostRoot: 容器挂载的宿主机根目录
+//
+//	ctx: 上下文对象
+//	hostRoot: 容器挂载的宿主机根目录
 //
 // 返回值:
-//   float64: 主 CPU 温度（摄氏度），无传感器时为 0
-//   []SensorTemp: 最多 8 条传感器明细
+//
+//	float64: 主 CPU 温度（摄氏度），无传感器时为 0
+//	[]SensorTemp: 最多 8 条传感器明细
 func collectTemperatures(ctx context.Context, hostRoot string) (float64, []SensorTemp) {
 	var list []SensorTemp
 	seen := make(map[string]bool)
@@ -700,11 +750,13 @@ func collectTemperatures(ctx context.Context, hostRoot string) (float64, []Senso
 // collectTopProcesses 采集当前 CPU/内存综合占用最高的前 5 个进程快照。
 //
 // 参数:
-//   ctx: 上下文对象
-//   memTotal: 物理内存总量（字节），用于换算进程内存占比
+//
+//	ctx: 上下文对象
+//	memTotal: 物理内存总量（字节），用于换算进程内存占比
 //
 // 返回值:
-//   []ProcessStat: 最多 5 条进程快照，采集失败时返回 nil
+//
+//	[]ProcessStat: 最多 5 条进程快照，采集失败时返回 nil
 func (c *Collector) collectTopProcesses(ctx context.Context, memTotal uint64) []ProcessStat {
 	now := time.Now()
 	elapsed := now.Sub(c.prevProcTime).Seconds()

@@ -150,6 +150,12 @@ func (c *Client) Report(ctx context.Context, req *collector.ReportRequest) (*Ser
 }
 
 func (c *Client) postJSON(ctx context.Context, path string, payload any) (*ServerConfigAck, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	rawBody, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("序列化请求数据失败: %w", err)
@@ -175,12 +181,17 @@ func (c *Client) postJSON(ctx context.Context, path string, payload any) (*Serve
 
 	var lastErr error
 	for attempt := 0; attempt < attempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, err
+		}
 		if attempt > 0 {
 			if err := c.waitRetry(ctx, attempt); err != nil {
 				return nil, lastErr
 			}
 		}
-
 		ack, retryable, reqErr := c.doPostAttempt(ctx, path, rawBody, wireBody, attempt)
 		if reqErr == nil {
 			return ack, nil
@@ -227,6 +238,9 @@ func (c *Client) doPostAttempt(ctx context.Context, path string, rawBody, wireBo
 		req.Header.Set("Content-Encoding", "gzip")
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		c.httpClient.CloseIdleConnections()

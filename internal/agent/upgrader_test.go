@@ -1,10 +1,16 @@
 package agent
 
 import (
+	"context"
+	"fmt"
+	"os"
 	"os/exec"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
 	"github.com/seakee/dudu-probe/internal/client"
 	"github.com/seakee/dudu-probe/internal/collector"
 	"github.com/seakee/dudu-probe/internal/config"
@@ -134,14 +140,171 @@ func TestApplyAckSyncsAndClearsPingTargets(t *testing.T) {
 	}
 }
 
+func TestHelperRunWithTimeoutProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+	switch os.Getenv("DUDU_PROBE_TEST_HELPER") {
+	case "output-and-exit":
+		fmt.Print("upgrade-ok\n")
+		os.Exit(0)
+	case "sleep":
+		fmt.Print("started\n")
+		time.Sleep(10 * time.Second)
+		os.Exit(0)
+	case "hold-pipe":
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			time.Sleep(40 * time.Millisecond)
+			if _, err := os.Stdout.WriteString("."); err != nil {
+				os.Exit(0)
+			}
+		}
+		os.Exit(0)
+	case "inherit-pipe-exit":
+		fmt.Print("parent-done\n")
+		cmd := exec.Command(os.Args[0], "-test.run=^TestHelperRunWithTimeoutProcess$")
+		cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1", "DUDU_PROBE_TEST_HELPER=hold-pipe")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Start(); err != nil {
+			os.Exit(2)
+		}
+		os.Exit(0)
+	case "inherit-pipe-timeout":
+		cmd := exec.Command(os.Args[0], "-test.run=^TestHelperRunWithTimeoutProcess$")
+		cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1", "DUDU_PROBE_TEST_HELPER=hold-pipe")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Start(); err != nil {
+			os.Exit(2)
+		}
+		time.Sleep(10 * time.Second)
+		os.Exit(0)
+	default:
+		os.Exit(3)
+	}
+}
+
+func TestRunWithTimeoutSuccess(t *testing.T) {
+	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
+	t.Setenv("DUDU_PROBE_TEST_HELPER", "output-and-exit")
+
+	out, err := runWithTimeout(context.Background(), 5*time.Second, os.Args[0], "-test.run=^TestHelperRunWithTimeoutProcess$")
+	if err != nil {
+		t.Fatalf("expected nil error, got %v (out=%q)", err, string(out))
+	}
+	if !strings.Contains(string(out), "upgrade-ok") {
+		t.Fatalf("expected output to contain upgrade-ok, got %q", string(out))
+	}
+}
+
 func TestRunWithTimeoutReturnsOnTimeout(t *testing.T) {
-	cmd := exec.Command("sh", "-c", "sleep 5")
+	if runtime.GOOS != "windows" {
+		start := time.Now()
+		_, err := runWithTimeout(context.Background(), 80*time.Millisecond, "sh", "-c", "sleep 5")
+		if err != errUpgradeTimeout {
+			t.Fatalf("expected errUpgradeTimeout, got %v", err)
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Fatalf("expected runWithTimeout to return promptly, took %s", elapsed)
+		}
+	}
+
+	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
+	t.Setenv("DUDU_PROBE_TEST_HELPER", "sleep")
 	start := time.Now()
-	_, err := runWithTimeout(cmd, 80*time.Millisecond)
+	_, err := runWithTimeout(context.Background(), 80*time.Millisecond, os.Args[0], "-test.run=^TestHelperRunWithTimeoutProcess$")
 	if err != errUpgradeTimeout {
 		t.Fatalf("expected errUpgradeTimeout, got %v", err)
 	}
-	if elapsed := time.Since(start); elapsed > 3*time.Second {
-		t.Fatalf("expected runWithTimeout to return promptly, took %s", elapsed)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("expected helper runWithTimeout to return promptly, took %s", elapsed)
+	}
+}
+
+func TestRunWithTimeoutDeterministicRace(t *testing.T) {
+	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
+	t.Setenv("DUDU_PROBE_TEST_HELPER", "sleep")
+
+	const workers = 4
+	const rounds = 6
+	var wg sync.WaitGroup
+	errs := make(chan error, workers*rounds)
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range rounds {
+				start := time.Now()
+				_, err := runWithTimeout(context.Background(), 15*time.Millisecond, os.Args[0], "-test.run=^TestHelperRunWithTimeoutProcess$")
+				if err != errUpgradeTimeout {
+					errs <- fmt.Errorf("expected errUpgradeTimeout, got %v", err)
+					return
+				}
+				if elapsed := time.Since(start); elapsed > 2*time.Second {
+					errs <- fmt.Errorf("expected prompt timeout, took %s", elapsed)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+}
+
+func TestRunWithTimeoutDoesNotHangOnInheritedPipes(t *testing.T) {
+	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
+
+	t.Run("parent_exit_with_inherited_pipe", func(t *testing.T) {
+		t.Setenv("DUDU_PROBE_TEST_HELPER", "inherit-pipe-exit")
+		start := time.Now()
+		out, err := runWithTimeout(context.Background(), 5*time.Second, os.Args[0], "-test.run=^TestHelperRunWithTimeoutProcess$")
+		elapsed := time.Since(start)
+		if elapsed > 2*time.Second {
+			t.Fatalf("expected inherited pipe not to hang until grandchild exits, took %s", elapsed)
+		}
+		if !strings.Contains(string(out), "parent-done") {
+			t.Fatalf("expected parent output preserved, got %q (err=%v)", string(out), err)
+		}
+	})
+
+	t.Run("timeout_with_inherited_pipe", func(t *testing.T) {
+		t.Setenv("DUDU_PROBE_TEST_HELPER", "inherit-pipe-timeout")
+		start := time.Now()
+		_, err := runWithTimeout(context.Background(), 60*time.Millisecond, os.Args[0], "-test.run=^TestHelperRunWithTimeoutProcess$")
+		elapsed := time.Since(start)
+		if err != errUpgradeTimeout {
+			t.Fatalf("expected errUpgradeTimeout, got %v", err)
+		}
+		if elapsed > 2*time.Second {
+			t.Fatalf("expected prompt timeout despite inherited pipe, took %s", elapsed)
+		}
+	})
+}
+
+func TestRunWithTimeoutParentCancel(t *testing.T) {
+	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
+	t.Setenv("DUDU_PROBE_TEST_HELPER", "sleep")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := runWithTimeout(ctx, 5*time.Second, os.Args[0], "-test.run=^TestHelperRunWithTimeoutProcess$")
+	if err != errUpgradeTimeout {
+		t.Fatalf("expected errUpgradeTimeout on parent deadline, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("expected prompt parent cancel, took %s", elapsed)
+	}
+
+	canceledCtx, cancelNow := context.WithCancel(context.Background())
+	cancelNow()
+	_, err = runWithTimeout(canceledCtx, 5*time.Second, os.Args[0], "-test.run=^TestHelperRunWithTimeoutProcess$")
+	if err == nil || err == errUpgradeTimeout {
+		t.Fatalf("expected context cancellation error, got %v", err)
 	}
 }

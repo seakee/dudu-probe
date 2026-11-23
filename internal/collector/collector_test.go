@@ -71,3 +71,52 @@ func TestCollectHostMetaAndMetrics(t *testing.T) {
 		t.Fatalf("expected non-zero MemTotal")
 	}
 }
+
+func TestCollectHostMetaAndMetricsCancellation(t *testing.T) {
+	col := New("/")
+
+	// 1. 已取消上下文采集 HostMeta 不得缓存残缺数据
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	metaCanceled := col.CollectHostMeta(canceledCtx, true)
+	if metaCanceled == nil || metaCanceled.OSName == "" {
+		t.Fatalf("expected minimal fallback HostMeta, got %+v", metaCanceled)
+	}
+	col.mu.Lock()
+	cachedAfterCancel := col.cachedMeta
+	lastRefreshAfterCancel := col.lastMetaRefresh
+	col.mu.Unlock()
+	if cachedAfterCancel != nil || !lastRefreshAfterCancel.IsZero() {
+		t.Fatalf("expected canceled CollectHostMeta not to populate cache, got cached=%+v refresh=%v", cachedAfterCancel, lastRefreshAfterCancel)
+	}
+
+	// 2. 健康上下文采集并缓存后，再次用过期上下文调用必须保留既有完整缓存
+	validCtx, cancelValid := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelValid()
+	metaValid := col.CollectHostMeta(validCtx, true)
+	if metaValid == nil || metaValid.MemTotal == 0 {
+		t.Fatalf("expected full HostMeta with MemTotal > 0, got %+v", metaValid)
+	}
+	expiredCtx, cancelExpired := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancelExpired()
+	metaAfterExpiry := col.CollectHostMeta(expiredCtx, true)
+	if metaAfterExpiry == nil || metaAfterExpiry.MemTotal != metaValid.MemTotal {
+		t.Fatalf("expected existing full cache preserved on expired context, got %+v vs %+v", metaAfterExpiry, metaValid)
+	}
+
+	// 3. CollectMetrics 在已取消或过期上下文中返回错误且不污染采样基线
+	col.mu.Lock()
+	col.hasPrevSample = false
+	prevSampleTime := col.lastSampleTime
+	col.mu.Unlock()
+	if _, err := col.CollectMetrics(canceledCtx); err == nil {
+		t.Fatal("expected error from CollectMetrics on canceled context")
+	}
+	col.mu.Lock()
+	hasPrev := col.hasPrevSample
+	afterSampleTime := col.lastSampleTime
+	col.mu.Unlock()
+	if hasPrev || !afterSampleTime.Equal(prevSampleTime) {
+		t.Fatalf("expected canceled CollectMetrics not to commit sample baseline: hasPrev=%v time=%v vs %v", hasPrev, afterSampleTime, prevSampleTime)
+	}
+}

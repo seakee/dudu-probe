@@ -2,6 +2,8 @@
 package agent
 
 import (
+	"context"
+	"errors"
 	"log"
 	"os"
 	"os/exec"
@@ -18,6 +20,8 @@ const (
 	defaultProbeRepo = "seakee/dudu-probe"
 	// upgradeTimeout 单次自升级脚本执行的最长等待时间。
 	upgradeTimeout = 10 * time.Minute
+	// upgradePipeWaitDelay 子进程退出或超时后等待继承 I/O 管道关闭的上限，防止孤儿进程阻塞输出读取。
+	upgradePipeWaitDelay = 500 * time.Millisecond
 	// upgradeRetryCooldown 升级失败后的重试冷却时间，避免每次心跳重复拉取安装脚本。
 	upgradeRetryCooldown = 5 * time.Minute
 )
@@ -48,8 +52,9 @@ func NewUpgrader(logger *log.Logger) *Upgrader {
 // MaybeUpgrade 在检测到服务端下发更高目标版本时异步触发自升级（单飞执行）。
 //
 // 参数:
-//   targetVersion: 服务端下发的目标版本号，为空表示无需升级
-//   mirrorURL: 可选镜像加速前缀，为空时直连 GitHub
+//
+//	targetVersion: 服务端下发的目标版本号，为空表示无需升级
+//	mirrorURL: 可选镜像加速前缀，为空时直连 GitHub
 func (u *Upgrader) MaybeUpgrade(targetVersion, mirrorURL string) {
 	target := strings.TrimSpace(targetVersion)
 	if target == "" || !versionPattern.MatchString(target) {
@@ -92,9 +97,7 @@ func (u *Upgrader) MaybeUpgrade(targetVersion, mirrorURL string) {
 }
 
 func (u *Upgrader) runUpgrade(target, mirrorURL string) error {
-	cmd := exec.Command("sh", "-c", buildUpgradeCommand(target, mirrorURL))
-	cmd.Env = os.Environ()
-	out, err := runWithTimeout(cmd, upgradeTimeout)
+	out, err := runWithTimeout(context.Background(), upgradeTimeout, "sh", "-c", buildUpgradeCommand(target, mirrorURL))
 	if err != nil {
 		if len(out) > 0 {
 			u.logger.Printf("[dudu-probe] 升级命令输出: %s", strings.TrimSpace(string(out)))
@@ -107,11 +110,13 @@ func (u *Upgrader) runUpgrade(target, mirrorURL string) error {
 // buildUpgradeCommand 构造探针自升级 shell 命令。
 //
 // 参数:
-//   target: 目标版本号，需已通过版本号格式校验
-//   mirrorURL: 可选镜像加速前缀，非法地址将被忽略
+//
+//	target: 目标版本号，需已通过版本号格式校验
+//	mirrorURL: 可选镜像加速前缀，非法地址将被忽略
 //
 // 返回值:
-//   string: 可直接交给 sh -c 执行的命令
+//
+//	string: 可直接交给 sh -c 执行的命令
 func buildUpgradeCommand(target, mirrorURL string) string {
 	repo := strings.TrimSpace(os.Getenv("DUDU_PROBE_REPO"))
 	if repo == "" {
@@ -148,31 +153,26 @@ func buildUpgradeCommand(target, mirrorURL string) string {
 	return sb.String()
 }
 
-func runWithTimeout(cmd *exec.Cmd, timeout time.Duration) ([]byte, error) {
-	done := make(chan struct{})
-	var out []byte
-	var err error
+func runWithTimeout(ctx context.Context, timeout time.Duration, name string, args ...string) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	defer cancel()
 
-	go func() {
-		out, err = cmd.CombinedOutput()
-		close(done)
-	}()
+	cmd := exec.CommandContext(ctx, name, args...)
+	configureTimeoutCmd(cmd, upgradePipeWaitDelay)
 
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case <-done:
-		return out, err
-	case <-timer.C:
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-		}
+	out, err := cmd.CombinedOutput()
+	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return out, errUpgradeTimeout
 	}
+	return out, err
 }
 
 type upgradeTimeoutError struct{}
