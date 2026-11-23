@@ -710,6 +710,22 @@ func TestOCIIPv6ObservationNonLinuxNonOCIAndDMI(t *testing.T) {
 		t.Fatalf("expected dmiUnknown for generic QEMU, got %v", got)
 	}
 
+	// 回退 sysRoot 即使存在非 OCI 标记，也不得与已命中的 HOST_SYS DMI 目录混读字段
+	fallbackRoot := t.TempDir()
+	fallbackDMI := filepath.Join(fallbackRoot, "sys", "class", "dmi", "id")
+	if err := os.MkdirAll(fallbackDMI, 0o755); err != nil {
+		t.Fatalf("mkdir fallback dmi: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(fallbackDMI, "product_name"), []byte("Virtual Machine\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fallbackDMI, "bios_vendor"), []byte("Microsoft Corporation\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := detectLinuxDMI(fallbackRoot); got != dmiUnknown {
+		t.Fatalf("expected HOST_SYS dmi dir not to mix fields from fallback root, got %v", got)
+	}
+
 	_ = os.WriteFile(filepath.Join(dmiDir, "sys_vendor"), []byte("Hetzner\n"), 0o644)
 	if got := detectLinuxDMI("/"); got != dmiNonOCI {
 		t.Fatalf("expected dmiNonOCI for Hetzner, got %v", got)

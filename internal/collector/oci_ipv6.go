@@ -887,16 +887,27 @@ func linuxSysRoots(hostRoot string) []string {
 	return roots
 }
 
-func detectLinuxDMI(hostRoot string) dmiPlatform {
-	roots := linuxSysRoots(hostRoot)
-	readField := func(name string) string {
-		for _, sysRoot := range roots {
-			data, err := os.ReadFile(filepath.Join(sysRoot, "class/dmi/id", name))
-			if err == nil {
-				return strings.TrimSpace(string(data))
-			}
+func selectLinuxDMIDir(hostRoot string) string {
+	for _, sysRoot := range linuxSysRoots(hostRoot) {
+		dmiDir := filepath.Join(sysRoot, "class", "dmi", "id")
+		if info, err := os.Stat(dmiDir); err == nil && info.IsDir() {
+			return dmiDir
 		}
-		return ""
+	}
+	return ""
+}
+
+func detectLinuxDMI(hostRoot string) dmiPlatform {
+	dmiDir := selectLinuxDMIDir(hostRoot)
+	if dmiDir == "" {
+		return dmiUnknown
+	}
+	readField := func(name string) string {
+		data, err := os.ReadFile(filepath.Join(dmiDir, name))
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSpace(string(data))
 	}
 
 	assetTag := readField("chassis_asset_tag")
