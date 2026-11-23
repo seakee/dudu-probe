@@ -27,8 +27,12 @@ LAUNCHD_ERR="/var/log/dudu-probe.err"
 QPKG_CONF="/etc/config/qpkg.conf"
 QPKG_DIR=""
 TMP_DIR=""
+TMP_BIN_STAGE=""
 
 cleanup_tmp() {
+  if [[ -n "${TMP_BIN_STAGE:-}" && -f "${TMP_BIN_STAGE}" ]]; then
+    rm -f "${TMP_BIN_STAGE}"
+  fi
   if [[ -n "${TMP_DIR:-}" && -d "${TMP_DIR}" ]]; then
     rm -rf "${TMP_DIR}"
   fi
@@ -204,10 +208,7 @@ download_binary() {
 
   if [[ "$tag" == "latest" ]]; then
     info "正在查询 GitHub 最新 Release 版本..."
-    if [[ -z "$MIRROR" ]]; then
-      tag="$(curl -fsSL --connect-timeout 8 "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep -Eo '"tag_name": *"[^"]+"' | head -n1 | cut -d'"' -f4 || true)"
-    fi
-    if [[ -z "$tag" ]]; then
+    if [[ -n "$prefix" ]]; then
       local effective_url
       effective_url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' --connect-timeout 10 "${prefix}https://github.com/${REPO}/releases/latest" 2>/dev/null || true)"
       if [[ "$effective_url" == *"/releases/tag/"* ]]; then
@@ -215,19 +216,40 @@ download_binary() {
         tag="${tag%%\?*}"
       fi
     fi
-    if [[ -z "$tag" ]]; then
+    if [[ -z "$tag" || "$tag" == "latest" ]]; then
+      tag="$(curl -fsSL --connect-timeout 8 "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep -Eo '"tag_name": *"[^"]+"' | head -n1 | cut -d'"' -f4 || true)"
+    fi
+    if [[ -z "$tag" || "$tag" == "latest" ]]; then
+      local effective_url
+      effective_url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' --connect-timeout 10 "https://github.com/${REPO}/releases/latest" 2>/dev/null || true)"
+      if [[ "$effective_url" == *"/releases/tag/"* ]]; then
+        tag="${effective_url##*/releases/tag/}"
+        tag="${tag%%\?*}"
+      fi
+    fi
+    if [[ -z "$tag" || "$tag" == "latest" ]]; then
       err "无法获取最新版本号，请使用 --version 指定版本（如 v1.0.0）"
     fi
   fi
 
   local ver_num="${tag#v}"
   local tarball="${BINARY_NAME}_${ver_num}_${OS}_${ARCH}.tar.gz"
-  local url="${prefix}https://github.com/${REPO}/releases/download/${tag}/${tarball}"
+  local direct_url="https://github.com/${REPO}/releases/download/${tag}/${tarball}"
+  local url="${prefix}${direct_url}"
   cleanup_tmp
   TMP_DIR="$(mktemp -d)"
 
   info "正在下载 ${url} ..."
-  curl -fL --retry 3 --connect-timeout 15 -o "${TMP_DIR}/${tarball}" "$url"
+  if ! curl -fL --retry 3 --connect-timeout 15 -o "${TMP_DIR}/${tarball}" "$url"; then
+    if [[ -n "$prefix" ]]; then
+      warn "镜像下载失败，回退直连 GitHub: ${direct_url}"
+      if ! curl -fL --retry 3 --connect-timeout 15 -o "${TMP_DIR}/${tarball}" "$direct_url"; then
+        err "安装包下载失败: ${direct_url}"
+      fi
+    else
+      err "安装包下载失败: ${url}"
+    fi
+  fi
   tar -xzf "${TMP_DIR}/${tarball}" -C "$TMP_DIR"
 
   local bin_path
@@ -237,17 +259,25 @@ download_binary() {
   fi
 
   mkdir -p "$(dirname "$INSTALL_BIN")"
-  stop_service
+  if [[ "$ACTION" != "upgrade" ]]; then
+    stop_service
+  fi
   if is_qnap_qts; then
     local qdir
     qdir="$(resolve_qpkg_dir)"
     mkdir -p "$qdir"
-    cp -f "$bin_path" "${qdir}/${BINARY_NAME}"
-    chmod 0755 "${qdir}/${BINARY_NAME}"
+    TMP_BIN_STAGE="${qdir}/${BINARY_NAME}.tmp.$$"
+    cp -f "$bin_path" "$TMP_BIN_STAGE"
+    chmod 0755 "$TMP_BIN_STAGE"
+    mv -f "$TMP_BIN_STAGE" "${qdir}/${BINARY_NAME}"
+    TMP_BIN_STAGE=""
     ln -sf "${qdir}/${BINARY_NAME}" "$INSTALL_BIN"
   else
-    cp -f "$bin_path" "$INSTALL_BIN"
-    chmod 0755 "$INSTALL_BIN"
+    TMP_BIN_STAGE="${INSTALL_BIN}.tmp.$$"
+    cp -f "$bin_path" "$TMP_BIN_STAGE"
+    chmod 0755 "$TMP_BIN_STAGE"
+    mv -f "$TMP_BIN_STAGE" "$INSTALL_BIN"
+    TMP_BIN_STAGE=""
   fi
   ok "已安装二进制至 ${INSTALL_BIN} ($(${INSTALL_BIN} -version))"
   cleanup_tmp
@@ -389,13 +419,23 @@ User=root
 ExecStart=${INSTALL_BIN} -config ${CONFIG_FILE}
 Restart=always
 RestartSec=5s
+KillMode=process
 LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable --now dudu-probe
+    systemctl enable dudu-probe
+    if [[ "$ACTION" == "upgrade" ]] && grep -q 'dudu-probe\.service' /proc/self/cgroup 2>/dev/null; then
+      if command -v systemd-run >/dev/null 2>&1; then
+        systemd-run --quiet systemctl restart dudu-probe
+      else
+        systemctl --no-block restart dudu-probe
+      fi
+    else
+      systemctl restart dudu-probe
+    fi
     ok "systemd 服务已启动并设置为开机自启 (systemctl status dudu-probe)"
   elif command -v rc-service >/dev/null 2>&1; then
     mkdir -p "$(dirname "$OPENRC_INIT")"
@@ -415,7 +455,8 @@ EOF
     rc-service dudu-probe restart
     ok "OpenRC 服务已启动并设为开机自启"
   elif [[ "$(uname -s)" == "Linux" && -f /etc/rc.common && -d /etc/init.d ]]; then
-    cat >"$OPENRC_INIT" <<EOF
+    if [[ "$ACTION" != "upgrade" || ! -f "$OPENRC_INIT" ]]; then
+      cat >"$OPENRC_INIT" <<EOF
 #!/bin/sh /etc/rc.common
 START=99
 USE_PROCD=1
@@ -426,7 +467,8 @@ start_service() {
     procd_close_instance
 }
 EOF
-    chmod +x "$OPENRC_INIT"
+      chmod +x "$OPENRC_INIT"
+    fi
     "$OPENRC_INIT" enable
     if "$OPENRC_INIT" running >/dev/null 2>&1; then
       "$OPENRC_INIT" restart
