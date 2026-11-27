@@ -29,6 +29,7 @@ func main() {
 		timeoutSec  = flag.Int("timeout", 0, "HTTP 请求超时秒数 (默认 15)")
 		insecureTLS = flag.Bool("insecure", false, "跳过 HTTPS TLS 证书校验")
 		enableGzip  = flag.Bool("gzip", false, "启用上报请求 Gzip 压缩")
+		dialNetwork = flag.String("dial-network", "", "服务端连接拨号策略 (ipv4_first|tcp4|tcp6|auto，默认 ipv4_first)")
 		onceMode    = flag.Bool("once", false, "仅执行单次采集与上报后退出")
 		inspectMode = flag.Bool("inspect", false, "仅在本地采集一次指标并输出 JSON（不连接服务端）")
 		showVersion = flag.Bool("version", false, "输出版本信息并退出")
@@ -90,7 +91,9 @@ func main() {
 	if *enableGzip {
 		cfg.EnableGzip = true
 	}
-
+	if *dialNetwork != "" {
+		cfg.DialNetwork = *dialNetwork
+	}
 	if err := cfg.NormalizeAndValidate(); err != nil {
 		logger.Fatalf("配置校验失败: %v", err)
 	}

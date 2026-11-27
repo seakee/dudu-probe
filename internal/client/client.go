@@ -95,14 +95,22 @@ func New(cfg *config.Config) *Client {
 		respHeaderTimeout = timeout
 	}
 
+	dialNetwork, err := config.NormalizeDialNetwork(cfg.DialNetwork)
+	if err != nil {
+		dialNetwork = config.DialNetworkIPv4First
+	}
+	fallbackDelay := -1 * time.Nanosecond
+	if dialNetwork == config.DialNetworkAuto {
+		fallbackDelay = 300 * time.Millisecond
+	}
 	dialer := &net.Dialer{
 		Timeout:       dialTimeout,
 		KeepAlive:     defaultTCPKeepAlive,
-		FallbackDelay: 300 * time.Millisecond,
+		FallbackDelay: fallbackDelay,
 	}
 	tr := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           dialer.DialContext,
+		DialContext:           buildDialContext(dialer, dialNetwork),
 		ForceAttemptHTTP2:     false,
 		TLSNextProto:          make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
 		MaxIdleConns:          4,
@@ -124,6 +132,58 @@ func New(cfg *config.Config) *Client {
 		},
 		maxAttempts:    defaultMaxAttempts,
 		retryBaseDelay: defaultRetryBaseDelay,
+	}
+}
+
+type dialContextFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
+func buildDialContext(dialer *net.Dialer, dialNetwork string) dialContextFunc {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return dialWithPreference(ctx, dialer.DialContext, dialNetwork, network, addr)
+	}
+}
+
+// dialWithPreference 按配置的拨号协议偏好建立 TCP 连接。
+// 默认 ipv4_first 优先走 tcp4，确保双栈节点在 Cloudflare 等双栈域名下稳定使用 IPv4 上报来源 IP，
+// 同时对纯 IPv6 节点或 IPv6 字面量地址自动回退/直连 tcp6。
+func dialWithPreference(ctx context.Context, dialFn dialContextFunc, dialNetwork, network, addr string) (net.Conn, error) {
+	switch dialNetwork {
+	case config.DialNetworkAuto:
+		return dialFn(ctx, network, addr)
+	case config.DialNetworkTCP4:
+		if network == "tcp" || network == "tcp4" || network == "tcp6" {
+			return dialFn(ctx, "tcp4", addr)
+		}
+		return dialFn(ctx, network, addr)
+	case config.DialNetworkTCP6:
+		if network == "tcp" || network == "tcp4" || network == "tcp6" {
+			return dialFn(ctx, "tcp6", addr)
+		}
+		return dialFn(ctx, network, addr)
+	default:
+		if network != "tcp" {
+			return dialFn(ctx, network, addr)
+		}
+		if host, _, err := net.SplitHostPort(addr); err == nil {
+			if ip := net.ParseIP(host); ip != nil {
+				if ip.To4() != nil {
+					return dialFn(ctx, "tcp4", addr)
+				}
+				return dialFn(ctx, "tcp6", addr)
+			}
+		}
+		conn, err4 := dialFn(ctx, "tcp4", addr)
+		if err4 == nil {
+			return conn, nil
+		}
+		if ctx != nil && ctx.Err() != nil {
+			return nil, err4
+		}
+		conn, err6 := dialFn(ctx, "tcp6", addr)
+		if err6 == nil {
+			return conn, nil
+		}
+		return nil, fmt.Errorf("tcp4 dial failed (%v); tcp6 fallback failed: %w", err4, err6)
 	}
 }
 
