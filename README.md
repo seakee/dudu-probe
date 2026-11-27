@@ -14,7 +14,7 @@ Lightweight, zero-CGO server monitoring probe agent for **Dudu Server Monitor**.
   - Network quality: concurrent lightweight TCP-ping probing against server-assigned targets (e.g. the three Chinese carriers, home broadband, Cloudflare) reporting latency and packet loss.
   - OCI IPv6 automatic observation: on Linux OCI instances, queries IMDSv2 (`/opc/v2/vnics/`) on startup and at a 60s cadence (2s timeout, direct transport ignoring proxy env vars and redirects), matches the primary VNIC MAC to the local interface, verifies assigned global non-temporary/non-tentative/non-DAD-failed IPv6 addresses, and reports `ipv6_observation` on heartbeat reports (`--net=host` required in Docker); non-Linux and non-OCI hosts skip safely.
 - **Server-Driven Self-Upgrade**: The agent compares `target_version` delivered in the heartbeat response with its own version and upgrades in place (mirror acceleration supported), so no inbound port or manual SSH is required.
-- **Authenticated Reporting**: Every payload is signed with `HMAC-SHA256(node_key + timestamp + body, secret)`.
+- **Authenticated Reporting**: Every payload is signed with `HMAC-SHA256(node_key + timestamp + body, secret)`, with Gzip compression and IPv4-preferred dialing (`dial_network`: `ipv4_first` / `tcp4` / `tcp6` / `auto`, defaulting to `ipv4_first` with automatic `tcp6` fallback on IPv6-only hosts).
 - **One-Command Persistent Deployment**: Auto-detects `systemd`, `OpenRC` (Alpine), `procd` (OpenWrt), and `launchd` (macOS).
 
 ## Quick Start

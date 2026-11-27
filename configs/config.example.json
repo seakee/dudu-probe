@@ -6,5 +6,6 @@
   "http_timeout_sec": 15,
   "insecure_tls": false,
   "enable_gzip": true,
-  "host_root": "/"
+  "host_root": "/",
+  "dial_network": "ipv4_first"
 }

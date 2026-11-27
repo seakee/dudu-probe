@@ -4,10 +4,12 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"github.com/seakee/dudu-probe/internal/collector"
 	"github.com/seakee/dudu-probe/internal/config"
 	"github.com/seakee/dudu-probe/internal/version"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -301,4 +303,105 @@ func TestCanceledContextDoesNotSendRequest(t *testing.T) {
 	if hits.Load() != 0 {
 		t.Fatalf("expected 0 HTTP requests after context cancellation, got %d", hits.Load())
 	}
+}
+
+func TestDialWithPreference(t *testing.T) {
+	stubConn := func() net.Conn {
+		c1, c2 := net.Pipe()
+		_ = c2.Close()
+		return c1
+	}
+
+	t.Run("ipv4_first uses tcp4 on dual-stack hostname without tcp6 fallback", func(t *testing.T) {
+		var networks []string
+		conn, err := dialWithPreference(context.Background(), func(_ context.Context, network, _ string) (net.Conn, error) {
+			networks = append(networks, network)
+			return stubConn(), nil
+		}, config.DialNetworkIPv4First, "tcp", "api-bj.cute-dudu.win:443")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		_ = conn.Close()
+		if len(networks) != 1 || networks[0] != "tcp4" {
+			t.Fatalf("expected [tcp4], got %v", networks)
+		}
+	})
+
+	t.Run("ipv4_first falls back to tcp6 when tcp4 fails", func(t *testing.T) {
+		var networks []string
+		conn, err := dialWithPreference(context.Background(), func(_ context.Context, network, _ string) (net.Conn, error) {
+			networks = append(networks, network)
+			if network == "tcp4" {
+				return nil, errors.New("network is unreachable")
+			}
+			return stubConn(), nil
+		}, config.DialNetworkIPv4First, "tcp", "api-bj.cute-dudu.win:443")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		_ = conn.Close()
+		if len(networks) != 2 || networks[0] != "tcp4" || networks[1] != "tcp6" {
+			t.Fatalf("expected [tcp4 tcp6], got %v", networks)
+		}
+	})
+
+	t.Run("ipv4_first dials tcp6 directly for IPv6 literal", func(t *testing.T) {
+		var networks []string
+		conn, err := dialWithPreference(context.Background(), func(_ context.Context, network, _ string) (net.Conn, error) {
+			networks = append(networks, network)
+			return stubConn(), nil
+		}, config.DialNetworkIPv4First, "tcp", "[2606:4700::1]:443")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		_ = conn.Close()
+		if len(networks) != 1 || networks[0] != "tcp6" {
+			t.Fatalf("expected [tcp6], got %v", networks)
+		}
+	})
+
+	t.Run("tcp4 strict does not fall back to tcp6", func(t *testing.T) {
+		var networks []string
+		_, err := dialWithPreference(context.Background(), func(_ context.Context, network, _ string) (net.Conn, error) {
+			networks = append(networks, network)
+			return nil, errors.New("no route to host")
+		}, config.DialNetworkTCP4, "tcp", "api-bj.cute-dudu.win:443")
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if len(networks) != 1 || networks[0] != "tcp4" {
+			t.Fatalf("expected [tcp4], got %v", networks)
+		}
+	})
+
+	t.Run("ipv4_first skips tcp6 fallback when context canceled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		var networks []string
+		_, err := dialWithPreference(ctx, func(_ context.Context, network, _ string) (net.Conn, error) {
+			networks = append(networks, network)
+			cancel()
+			return nil, context.Canceled
+		}, config.DialNetworkIPv4First, "tcp", "api-bj.cute-dudu.win:443")
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if len(networks) != 1 || networks[0] != "tcp4" {
+			t.Fatalf("expected [tcp4], got %v", networks)
+		}
+	})
+
+	t.Run("auto preserves original tcp network", func(t *testing.T) {
+		var networks []string
+		conn, err := dialWithPreference(context.Background(), func(_ context.Context, network, _ string) (net.Conn, error) {
+			networks = append(networks, network)
+			return stubConn(), nil
+		}, config.DialNetworkAuto, "tcp", "api-bj.cute-dudu.win:443")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		_ = conn.Close()
+		if len(networks) != 1 || networks[0] != "tcp" {
+			t.Fatalf("expected [tcp], got %v", networks)
+		}
+	})
 }

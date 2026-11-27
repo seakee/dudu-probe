@@ -22,6 +22,14 @@ const (
 	MinReportIntervalSec = 2
 	// MaxReportIntervalSec 最大允许的上报间隔（秒）。
 	MaxReportIntervalSec = 300
+	// DialNetworkIPv4First 默认拨号策略：优先使用 IPv4 (tcp4)，不可达时回退 IPv6 (tcp6)。
+	DialNetworkIPv4First = "ipv4_first"
+	// DialNetworkTCP4 强制仅使用 IPv4 (tcp4) 拨号。
+	DialNetworkTCP4 = "tcp4"
+	// DialNetworkTCP6 强制仅使用 IPv6 (tcp6) 拨号。
+	DialNetworkTCP6 = "tcp6"
+	// DialNetworkAuto 使用 Go 标准库双栈自动拨号（Happy Eyeballs）。
+	DialNetworkAuto = "auto"
 )
 
 // Config 定义探针运行配置。
@@ -42,6 +50,8 @@ type Config struct {
 	EnableGzip bool `json:"enable_gzip"`
 	// HostRoot 容器挂载的宿主机根目录（默认 /）
 	HostRoot string `json:"host_root"`
+	// DialNetwork 服务端连接拨号策略（ipv4_first | tcp4 | tcp6 | auto，默认 ipv4_first）
+	DialNetwork string `json:"dial_network,omitempty"`
 }
 
 // Default 返回带默认值的配置实例。
@@ -51,6 +61,7 @@ func Default() *Config {
 		HTTPTimeoutSec:    DefaultHTTPTimeoutSec,
 		EnableGzip:        true,
 		HostRoot:          "/",
+		DialNetwork:       DialNetworkIPv4First,
 	}
 }
 
@@ -106,6 +117,9 @@ func (c *Config) ApplyEnv() {
 	if v := strings.TrimSpace(os.Getenv("HOST_ROOT")); v != "" {
 		c.HostRoot = v
 	}
+	if v := strings.TrimSpace(os.Getenv("DUDU_PROBE_DIAL_NETWORK")); v != "" {
+		c.DialNetwork = v
+	}
 }
 
 // NormalizeAndValidate 规范化并校验必填配置。
@@ -134,7 +148,28 @@ func (c *Config) NormalizeAndValidate() error {
 	if c.HostRoot == "" {
 		c.HostRoot = "/"
 	}
+	normalizedDial, err := NormalizeDialNetwork(c.DialNetwork)
+	if err != nil {
+		return err
+	}
+	c.DialNetwork = normalizedDial
 	return nil
+}
+
+// NormalizeDialNetwork 规范化并校验服务端拨号策略配置。
+func NormalizeDialNetwork(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", DialNetworkIPv4First, "prefer_ipv4":
+		return DialNetworkIPv4First, nil
+	case DialNetworkTCP4, "ipv4":
+		return DialNetworkTCP4, nil
+	case DialNetworkTCP6, "ipv6":
+		return DialNetworkTCP6, nil
+	case DialNetworkAuto, "tcp":
+		return DialNetworkAuto, nil
+	default:
+		return "", fmt.Errorf("无效的 dial_network 配置 %q（仅支持 ipv4_first/tcp4/tcp6/auto）", raw)
+	}
 }
 
 // ClampInterval 将上报间隔限制在安全范围内。
